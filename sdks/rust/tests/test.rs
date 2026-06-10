@@ -853,3 +853,143 @@ procedural_view_pk_tests!(rust_procedural_view_pk, "sdk-test-procedural-view-pk"
 procedural_view_pk_tests!(csharp_procedural_view_pk, "sdk-test-procedural-view-pk-cs");
 procedural_view_pk_tests!(typescript_procedural_view_pk, "sdk-test-procedural-view-pk-ts");
 procedural_view_pk_tests!(cpp_procedural_view_pk, "sdk-test-procedural-view-pk-cpp");
+
+#[test]
+fn shadow_access_capture() {
+    use std::time::{Duration, Instant};
+
+    let report_dir = {
+        let mut path = std::env::temp_dir();
+        path.push(format!("stdb-shadow-access-{}", std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()));
+        std::fs::create_dir_all(&path).expect("failed to create report dir");
+        path
+    };
+
+    // Safety: tests in this file run with --test-threads=1; no concurrent set_var races.
+    unsafe {
+        std::env::set_var("STDB_SHADOW_ACCESS", "1");
+        std::env::set_var("STDB_SHADOW_ACCESS_REPORT", report_dir.to_str().unwrap());
+        std::env::set_var("STDB_SHADOW_ACCESS_REPORT_INTERVAL_SECS", "1");
+    }
+
+    const CLIENT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/shadow-access-client");
+
+    platform_test_builder(CLIENT, None)
+        .with_name("shadow-access-capture")
+        .with_module("sdk-test-shadow-access")
+        .with_language("rust")
+        .with_bindings_dir("src/module_bindings")
+        .build()
+        .run();
+
+    // Poll for the report JSON file (db identity is unknown, scan the dir).
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let report: serde_json::Value = loop {
+        if Instant::now() > deadline {
+            panic!("timed out waiting for shadow access report in {}", report_dir.display());
+        }
+        let entry = std::fs::read_dir(&report_dir)
+            .expect("failed to read report dir")
+            .filter_map(|e| e.ok())
+            .find(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"));
+        if let Some(entry) = entry {
+            if let Ok(contents) = std::fs::read_to_string(entry.path()) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&contents) {
+                    // Require nonzero reducer calls to guard against an empty/partial write.
+                    let total_calls: u64 = v["reducers"]
+                        .as_array()
+                        .map(|arr| arr.iter().filter_map(|r| r["calls"].as_u64()).sum())
+                        .unwrap_or(0);
+                    if total_calls > 0 {
+                        break v;
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+
+    // THE soundness gate: no under-approximations across all reducers.
+    let under_details: Vec<_> = report["reducers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["under_approx_count"].as_u64().unwrap_or(0) > 0)
+        .map(|r| format!("  reducer={} count={} details={:?}", r["name"], r["under_approx_count"], r["under_approx_details"]))
+        .collect();
+    assert!(
+        under_details.is_empty(),
+        "under-approximation detected (soundness violation):\n{}",
+        under_details.join("\n")
+    );
+
+    let write_a = report["reducers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "write_a")
+        .expect("write_a reducer not found in report");
+    assert!(!write_a["wildcard"].as_bool().unwrap_or(true), "write_a must not be wildcard");
+    assert!(
+        write_a["predicted_writes"].as_array().unwrap().iter().any(|t| t == "a"),
+        "write_a.predicted_writes must contain 'a', got: {:?}",
+        write_a["predicted_writes"]
+    );
+
+    let indirect = report["reducers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "indirect_touch")
+        .expect("indirect_touch reducer not found in report");
+    if cfg!(debug_assertions) {
+        assert!(
+            indirect["wildcard"].as_bool().unwrap_or(false),
+            "indirect_touch must be wildcard"
+        );
+    }
+
+    let has_wide_batch = report["batches"]["width_histogram"]
+        .as_object()
+        .map(|h| h.iter().any(|(k, v)| k.parse::<u64>().unwrap_or(0) >= 2 && v.as_u64().unwrap_or(0) > 0))
+        .unwrap_or(false);
+    assert!(has_wide_batch, "expected at least one batch with width >= 2");
+
+    // NO batch record's members (reducer ids) should contain BOTH write_c_1 and write_c_2.
+    // Reducer ids are positional; find by name in the reducers array.
+    let find_id = |name: &str| -> Option<u32> {
+        report["reducers"]
+            .as_array()?
+            .iter()
+            .find(|r| r["name"] == name)
+            .and_then(|r| r["id"].as_u64())
+            .map(|id| id as u32)
+    };
+    if let (Some(c1_id), Some(c2_id)) = (find_id("write_c_1"), find_id("write_c_2")) {
+        for (i, batch) in report["batches"]["records"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .enumerate()
+        {
+            let members: Vec<u64> = batch["members"]
+                .as_array()
+                .unwrap_or(&vec![])
+                .iter()
+                .filter_map(|v| v.as_u64())
+                .collect();
+            let has_c1 = members.contains(&(c1_id as u64));
+            let has_c2 = members.contains(&(c2_id as u64));
+            assert!(
+                !(has_c1 && has_c2),
+                "batch record[{i}] contains both write_c_1 ({c1_id}) and write_c_2 ({c2_id}), which must not batch together: {members:?}"
+            );
+        }
+    }
+
+    let handoff = report["handoff_proxy_ns_lower_bound"].as_u64().unwrap_or(0);
+    assert!(handoff > 0, "handoff_proxy_ns_lower_bound must be > 0");
+}

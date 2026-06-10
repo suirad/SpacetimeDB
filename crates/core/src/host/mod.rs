@@ -16,6 +16,7 @@ mod module_common;
 #[allow(clippy::too_many_arguments)]
 pub mod module_host;
 pub mod scheduler;
+pub mod shadow_access;
 pub mod wasmtime;
 
 // Visible for integration testing.

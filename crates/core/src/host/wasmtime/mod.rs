@@ -178,7 +178,7 @@ impl WasmtimeRuntime {
         let procedure_module = WasmtimeAsyncModule::new(procedure_module);
         let thread_name = wasm_worker_thread_name(&mcc.replica_ctx.database_identity);
 
-        let (module, init_inst) = WasmModuleHostActor::new(mcc, module)?;
+        let (module, init_inst) = WasmModuleHostActor::new(mcc, module, program_bytes)?;
         let procedure_module = module.with_runtime_module(procedure_module)?;
         Ok(super::module_host::ModuleWithInstance::Wasm {
             module,

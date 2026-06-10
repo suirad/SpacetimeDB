@@ -16,8 +16,10 @@ mod error;
 mod ids;
 mod imports;
 mod map;
+pub mod matrix;
 mod reachability;
 mod reducers;
 
 pub use analyze::{analyze, AccessSet};
 pub use error::AnalysisError;
+pub use matrix::ConflictMatrix;

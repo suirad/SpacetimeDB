@@ -1,0 +1,12 @@
+[package]
+name = "sdk-test-shadow-access"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+spacetimedb = { path = "../../crates/bindings" }
+log = "0.4"

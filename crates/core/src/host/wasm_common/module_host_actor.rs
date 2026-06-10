@@ -15,6 +15,7 @@ use crate::host::module_host::{
     ViewCommandResult, ViewOutcome,
 };
 use crate::host::scheduler::{CallScheduledFunctionResult, ScheduledFunctionParams};
+use crate::host::shadow_access::{shadow_enabled, ObservedNames, ShadowAccess};
 use crate::host::{
     ArgsTuple, ModuleHost, ProcedureCallError, ProcedureCallResult, ReducerCallError, ReducerCallResult, ReducerId,
     ReducerOutcome, Scheduler, UpdateDatabaseResult,
@@ -338,6 +339,7 @@ pub struct WasmModuleHostActor<T: WasmModule> {
     module: T::InstancePre,
     common: ModuleCommon,
     func_names: Arc<FuncNames>,
+    shadow: Option<Arc<ShadowAccess>>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -382,6 +384,7 @@ impl<T: WasmModule> WasmModuleHostActor<T> {
     pub fn new(
         mcc: ModuleCreationContext,
         module: T,
+        program_bytes: &[u8],
     ) -> Result<(Self, WasmModuleInstance<T::Instance>), InitializationError> {
         log::trace!(
             "Making new WASM module host actor for database {} with module {}",
@@ -405,11 +408,14 @@ impl<T: WasmModule> WasmModuleHostActor<T> {
         // Validate and create a common module rom the raw definition.
         let common = build_common_module_from_raw(mcc, desc)?;
 
+        let shadow = build_shadow_access(&common, program_bytes);
+
         let func_names = Arc::new(func_names);
         let module = WasmModuleHostActor {
             module: uninit_instance,
             func_names,
             common,
+            shadow,
         };
         let initial_instance = module.make_from_instance(instance);
 
@@ -422,13 +428,18 @@ impl<T: WasmModule> WasmModuleHostActor<T> {
             module,
             common: self.common.clone(),
             func_names: self.func_names.clone(),
+            shadow: self.shadow.clone(),
         })
+    }
+
+    pub fn shadow(&self) -> Option<Arc<ShadowAccess>> {
+        self.shadow.clone()
     }
 }
 
 impl<T: WasmModule> WasmModuleHostActor<T> {
     fn make_from_instance(&self, mut instance: T::Instance) -> WasmModuleInstance<T::Instance> {
-        let common = InstanceCommon::new(&self.common);
+        let common = InstanceCommon::new(&self.common, self.shadow.clone());
         instance.set_module_def(common.info().module_def.clone());
         WasmModuleInstance {
             instance,
@@ -462,6 +473,28 @@ impl<T: WasmModule> WasmModuleHostActor<T> {
             .expect("failed to initialize instance");
         let _ = instance.extract_descriptions();
         self.make_from_instance(instance)
+    }
+}
+
+/// Build the shadow-access harness for a freshly published module, if enabled.
+///
+/// Analysis failure is sound to ignore: no analysis just means no shadow data,
+/// so it never blocks publish.
+fn build_shadow_access(common: &ModuleCommon, program_bytes: &[u8]) -> Option<Arc<ShadowAccess>> {
+    if !shadow_enabled() {
+        return None;
+    }
+    let info = common.info();
+    match spacetimedb_access_analysis::analyze(program_bytes, &info.module_def) {
+        Ok(sets) => {
+            let reducer_names = info.module_def.reducers().map(|r| r.name.to_string()).collect();
+            let database_identity = info.database_identity.to_hex().to_string();
+            Some(Arc::new(ShadowAccess::new(sets, reducer_names, database_identity)))
+        }
+        Err(err) => {
+            log::warn!("shadow access analysis failed; shadow disabled for this module: {err}");
+            None
+        }
     }
 }
 
@@ -611,10 +644,11 @@ pub struct InstanceCommon {
     info: Arc<ModuleInfo>,
     energy_monitor: Arc<dyn EnergyMonitor>,
     vm_metrics: AllVmMetrics,
+    shadow: Option<Arc<ShadowAccess>>,
 }
 
 impl InstanceCommon {
-    pub(crate) fn new(module: &ModuleCommon) -> Self {
+    pub(crate) fn new(module: &ModuleCommon, shadow: Option<Arc<ShadowAccess>>) -> Self {
         let info = module.info();
         let vm_metrics = AllVmMetrics::new(&info);
 
@@ -622,6 +656,7 @@ impl InstanceCommon {
             info: module.info(),
             vm_metrics,
             energy_monitor: module.energy_monitor(),
+            shadow,
         }
     }
 
@@ -955,6 +990,7 @@ impl InstanceCommon {
             reducer_id,
             args,
             timer,
+            shadow_seq,
         } = params;
         let caller_connection_id_opt = (caller_connection_id != ConnectionId::ZERO).then_some(caller_connection_id);
 
@@ -978,7 +1014,10 @@ impl InstanceCommon {
         };
 
         let workload = Workload::Reducer(ReducerContext::from(op.clone()));
-        let tx = tx.unwrap_or_else(|| stdb.begin_mut_tx(IsolationLevel::Serializable, workload));
+        let mut tx = tx.unwrap_or_else(|| stdb.begin_mut_tx(IsolationLevel::Serializable, workload));
+        if self.shadow.is_some() {
+            tx.enable_access_capture();
+        }
         let mut tx_slot = inst.tx_slot();
 
         let vm_metrics = self.vm_metrics.get_for_reducer_id(reducer_id);
@@ -990,6 +1029,25 @@ impl InstanceCommon {
 
         // Report execution metrics on each reducer call.
         vm_metrics.report(&result.stats);
+
+        // Shadow diff: resolve observed table ids to names and feed the harness
+        // before views run or `tx` is consumed, so view/lifecycle work can't
+        // pollute the observed set (it was already taken here).
+        if let Some(shadow) = &self.shadow {
+            let observed = tx.take_observed().map(|obs| {
+                let resolve = |id: TableId| {
+                    tx.table_name_from_id(id)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| format!("table#{}", id.0).into_boxed_str())
+                };
+                ObservedNames {
+                    reads: obs.reads.iter().map(|&id| resolve(id)).collect(),
+                    writes: obs.writes.iter().map(|&id| resolve(id)).collect(),
+                }
+            });
+            shadow.on_executed(shadow_seq, reducer_id, result.stats.total_duration(), observed);
+        }
 
         // An outer error occurred.
         // This signifies a logic error in the module rather than a properly

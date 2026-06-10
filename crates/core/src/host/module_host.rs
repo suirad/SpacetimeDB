@@ -421,6 +421,10 @@ struct WasmtimeModuleHost {
 }
 
 impl WasmtimeModuleHost {
+    fn shadow(&self) -> Option<Arc<crate::host::shadow_access::ShadowAccess>> {
+        self.module.shadow()
+    }
+
     fn enqueue_with_main_instance<A>(
         &self,
         label: &str,
@@ -749,6 +753,9 @@ pub struct CallReducerParams {
     pub timer: Option<Instant>,
     pub reducer_id: ReducerId,
     pub args: ArgsTuple,
+    /// Shadow-mode mirror sequence, set only on the wasm enqueue lanes; all other
+    /// producers leave it `None` so they appear as conservative sim barriers.
+    pub shadow_seq: Option<u64>,
 }
 
 impl CallReducerParams {
@@ -769,6 +776,7 @@ impl CallReducerParams {
             timer: None,
             reducer_id,
             args,
+            shadow_seq: None,
         }
     }
 }
@@ -2221,6 +2229,7 @@ impl ModuleHost {
             timer,
             reducer_id,
             args,
+            shadow_seq: None,
         })
     }
 
@@ -2266,8 +2275,15 @@ impl ModuleHost {
     async fn call_reducer_with_params(
         &self,
         reducer_name: &ReducerName,
-        params: CallReducerParams,
+        mut params: CallReducerParams,
     ) -> Result<ReducerCallResult, ReducerCallError> {
+        // Register on the wasm lane at enqueue time (the macro's wasm closure runs
+        // later on the executor thread and can't reach the shadow handle).
+        if let ModuleHostInner::Wasm(wasm_host) = &*self.inner {
+            if let Some(shadow) = wasm_host.shadow() {
+                params.shadow_seq = Some(shadow.register_enqueue(params.reducer_id));
+            }
+        }
         call_instance!(self, reducer_name, params, |p, inst| inst.call_reducer(p), |p, inst| {
             inst.call_reducer(p).await
         },)
@@ -2370,7 +2386,10 @@ impl ModuleHost {
                     reducer_name,
                     call.params,
                     |params, inst, on_panic| async move { inst.enqueue_reducer(params, on_panic).await },
-                    move |params, wasm_host, on_panic, timer_guard| {
+                    move |mut params, wasm_host, on_panic, timer_guard| {
+                        if let Some(shadow) = wasm_host.shadow() {
+                            params.shadow_seq = Some(shadow.register_enqueue(params.reducer_id));
+                        }
                         wasm_host.enqueue_with_main_instance(
                             &reducer_label,
                             on_panic,

@@ -385,6 +385,8 @@ impl InstanceEnv {
             self.schedule_row(stdb, tx, table_id, row_ptr)?;
         }
 
+        tx.record_table_write(&self.func_type, table_id);
+
         // Note, we update the metric for bytes written after the insert.
         // This is to capture auto-inc columns.
         tx.metrics.bytes_written += buffer.len();
@@ -462,6 +464,9 @@ impl InstanceEnv {
         if update_flags.is_scheduler_table {
             self.schedule_row(stdb, tx, table_id, row_ptr)?;
         }
+
+        tx.record_table_write(&self.func_type, table_id);
+
         tx.metrics.bytes_written += buffer.len();
         tx.metrics.rows_updated += 1;
 
@@ -481,6 +486,8 @@ impl InstanceEnv {
         let (table_id, _, iter) = stdb.index_scan_point(tx, index_id, point)?;
         // Re. `SmallVec`, `delete_by_field` only cares about 1 element, so optimize for that.
         let rows_to_delete = iter.map(|row_ref| row_ref.pointer()).collect::<SmallVec<[_; 1]>>();
+
+        tx.record_index_write(&self.func_type, index_id);
 
         Ok(Self::datastore_delete_by_index_scan(stdb, tx, table_id, rows_to_delete))
     }
@@ -504,6 +511,8 @@ impl InstanceEnv {
             IndexScanPointOrRange::Point(_, iter) => iter.map(|row_ref| row_ref.pointer()).collect(),
             IndexScanPointOrRange::Range(iter) => iter.map(|row_ref| row_ref.pointer()).collect(),
         };
+
+        tx.record_index_write(&self.func_type, index_id);
 
         Ok(Self::datastore_delete_by_index_scan(stdb, tx, table_id, rows_to_delete))
     }
@@ -556,7 +565,9 @@ impl InstanceEnv {
         tx.metrics.rows_scanned += relation.len();
 
         // Delete them and return how many we deleted.
-        Ok(stdb.delete_by_rel(tx, table_id, relation))
+        let deleted = stdb.delete_by_rel(tx, table_id, relation);
+        tx.record_table_write(&self.func_type, table_id);
+        Ok(deleted)
     }
 
     /// Deletes all rows in the table identified by `table_id`.
@@ -569,6 +580,7 @@ impl InstanceEnv {
         // To clear a table, we must find all the row pointers,
         // so we have scanned that many rows.
         tx.metrics.rows_scanned += rows_deleted as usize;
+        tx.record_table_write(&self.func_type, table_id);
 
         Ok(rows_deleted)
     }

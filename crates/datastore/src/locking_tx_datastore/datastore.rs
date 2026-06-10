@@ -916,6 +916,7 @@ impl MutTx for Locking {
             timer,
             ctx,
             metrics,
+            observed: None,
             _not_send: std::marker::PhantomData,
         }
     }
@@ -951,6 +952,7 @@ impl Locking {
             timer,
             ctx,
             metrics,
+            observed: None,
             _not_send: std::marker::PhantomData,
         })
     }

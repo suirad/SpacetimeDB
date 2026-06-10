@@ -37,7 +37,7 @@ use crate::{
 use core::{cell::RefCell, iter, mem, ops::RangeBounds};
 use itertools::Either;
 use smallvec::SmallVec;
-use spacetimedb_data_structures::map::{HashMap, HashSet, IntMap};
+use spacetimedb_data_structures::map::{HashMap, HashSet, IntMap, IntSet};
 use spacetimedb_durability::TxOffset;
 use spacetimedb_execution::{dml::MutDatastore, Datastore, DeltaStore, Row};
 use spacetimedb_lib::{
@@ -172,6 +172,13 @@ impl ViewReadSets {
     }
 }
 
+/// Per-reducer table access capture, populated during execution when enabled.
+#[derive(Default)]
+pub struct ObservedAccess {
+    pub reads: IntSet<TableId>,
+    pub writes: IntSet<TableId>,
+}
+
 type IndexKeyReadSet = HashMap<AlgebraicValue, HashSet<ViewCallInfo>>;
 type IndexColReadSet = HashMap<ColList, IndexKeyReadSet>;
 
@@ -287,6 +294,7 @@ pub struct MutTxId {
     pub timer: Instant,
     pub ctx: ExecutionContext,
     pub metrics: ExecutionMetrics,
+    pub(super) observed: Option<Box<ObservedAccess>>,
     // Marks `MutTxId` as `!Send` by embedding a non-`Send` type.
     pub(crate) _not_send: PhantomData<std::rc::Rc<()>>,
 }
@@ -298,6 +306,8 @@ impl MutTxId {
     pub fn record_table_scan(&mut self, op: &FuncCallType, table_id: TableId) {
         if let FuncCallType::View(view) = op {
             self.read_sets.insert_full_table_scan(table_id, view.clone());
+        } else if matches!(op, FuncCallType::Reducer) && self.observed.is_some() {
+            self.record_observed_read(table_id);
         }
     }
 
@@ -323,7 +333,9 @@ impl MutTxId {
     ) {
         if let FuncCallType::View(view) = op {
             self.record_index_scan_range_inner(view, table_id, index_id, point);
-        };
+        } else if matches!(op, FuncCallType::Reducer) && self.observed.is_some() {
+            self.record_observed_read(table_id);
+        }
     }
 
     // This is cold as we don't want it to be inlined in case it doesn't end up getting called.
@@ -357,7 +369,9 @@ impl MutTxId {
     ) {
         if let FuncCallType::View(view) = op {
             self.record_index_scan_point_inner(view, table_id, index_id, point);
-        };
+        } else if matches!(op, FuncCallType::Reducer) && self.observed.is_some() {
+            self.record_observed_read(table_id);
+        }
     }
 
     // This is cold as we don't want it to be inlined in case it doesn't end up getting called.
@@ -379,6 +393,49 @@ impl MutTxId {
         let cols = idx.indexed_columns().clone();
         let point = idx.key_into_algebraic_value(point);
         self.read_sets.insert_index_scan(table_id, cols, point, view.clone());
+    }
+
+    /// Enable per-reducer access capture for this transaction.
+    pub fn enable_access_capture(&mut self) {
+        self.observed = Some(Box::default());
+    }
+
+    /// Take the captured access set, leaving `None` in its place.
+    pub fn take_observed(&mut self) -> Option<Box<ObservedAccess>> {
+        self.observed.take()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn record_observed_read(&mut self, table_id: TableId) {
+        if let Some(obs) = &mut self.observed {
+            obs.reads.insert(table_id);
+        }
+    }
+
+    /// Record a reducer write to `table_id`.
+    pub fn record_table_write(&mut self, op: &FuncCallType, table_id: TableId) {
+        if matches!(op, FuncCallType::Reducer) && self.observed.is_some() {
+            self.record_observed_write_table(table_id);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn record_observed_write_table(&mut self, table_id: TableId) {
+        if let Some(obs) = &mut self.observed {
+            obs.writes.insert(table_id);
+        }
+    }
+
+    /// Record a reducer write via `index_id`; resolves to parent table.
+    /// If the index cannot be resolved the operation itself will fail, so skipping is sound.
+    pub fn record_index_write(&mut self, op: &FuncCallType, index_id: IndexId) {
+        if matches!(op, FuncCallType::Reducer) && self.observed.is_some() {
+            if let Some((table_id, _, _)) = self.get_table_and_index(index_id) {
+                self.record_observed_write_table(table_id);
+            }
+        }
     }
 
     /// Returns the views whose read sets overlaps with this transaction's write set
