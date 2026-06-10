@@ -1,6 +1,7 @@
 [workspace]
 exclude = ["crates/smoketests/modules"]
 members = [
+  "crates/access-analysis",
   "crates/auth",
   "crates/bench",
   "crates/bindings-sys",
@@ -40,6 +41,7 @@ members = [
   "crates/table",
   "crates/testing",
   "crates/update",
+  "modules/access-analysis-fixture",
   "modules/benchmarks",
   "modules/keynote-benchmarks",
   "modules/perf-test",
@@ -122,6 +124,7 @@ rust-version = "1.93.0"
 
 [workspace.dependencies]
 spacetimedb = { path = "crates/bindings", version = "=2.6.0" }
+spacetimedb-access-analysis = { path = "crates/access-analysis", version = "=2.6.0" }
 spacetimedb-auth = { path = "crates/auth", version = "=2.6.0" }
 spacetimedb-bindings-macro = { path = "crates/bindings-macro", version = "=2.6.0" }
 spacetimedb-bindings-sys = { path = "crates/bindings-sys", version = "=2.6.0" }
@@ -348,6 +351,7 @@ v8 = "=145.0.0"
 deno_core_icudata = "0.77"
 
 walkdir = "2.2.5"
+walrus = "0.26"
 wasmbin = "0.6"
 webbrowser = "1.0.2"
 windows-sys = "0.59"

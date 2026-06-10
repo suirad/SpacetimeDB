@@ -1,0 +1,23 @@
+[package]
+name = "spacetimedb-access-analysis"
+version.workspace = true
+edition.workspace = true
+license = "BSL-1.1"
+description = "Static per-reducer table access-set analysis of SpacetimeDB WASM modules."
+
+[lints]
+workspace = true
+
+[dependencies]
+spacetimedb-schema.workspace = true
+spacetimedb-lib.workspace = true
+walrus.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+spacetimedb-testing = { path = "../testing" }
+wat = "1"
+
+[[example]]
+name = "dump"
+path = "examples/dump.rs"
