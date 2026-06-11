@@ -1605,13 +1605,7 @@ impl MutTxId {
 
     /// Looks up a index id by the index's canonical name or its accessor/alias name.
     pub fn index_id_from_name_or_alias(&self, index_name_or_alias: &str) -> Result<Option<IndexId>> {
-        if let Some(index_id) = self.index_id_from_name(index_name_or_alias)? {
-            return Ok(Some(index_id));
-        }
-        let Some(row) = self.find_st_index_accessor_row(index_name_or_alias)? else {
-            return Ok(None);
-        };
-        self.index_id_from_name(&row.index_name)
+        StateView::index_id_from_name_or_alias(self, index_name_or_alias)
     }
 
     /// Returns an iterator yielding rows by performing a point index scan
@@ -1635,7 +1629,7 @@ impl MutTxId {
     }
 
     /// See [`MutTxId::index_scan_point`].
-    fn index_scan_point_inner<'a>(
+    pub(super) fn index_scan_point_inner<'a>(
         tx_state: &'a TxState,
         table_id: TableId,
         tx_index: Option<TableAndIndex<'a>>,
@@ -1696,7 +1690,7 @@ impl MutTxId {
 
     /// See [`MutTxId::index_scan_range`].
     #[inline(always)]
-    fn index_scan_range_via_algebraic_value<'a>(
+    pub(super) fn index_scan_range_via_algebraic_value<'a>(
         tx_state: &'a TxState,
         table_id: TableId,
         tx_index: Option<TableAndIndex<'a>>,
@@ -1712,7 +1706,7 @@ impl MutTxId {
 
     /// See [`MutTxId::index_scan_range`].
     #[inline(always)]
-    fn index_scan_range_inner<'a, 'b>(
+    pub(super) fn index_scan_range_inner<'a, 'b>(
         tx_state: &'a TxState,
         table_id: TableId,
         tx_index: Option<TableAndIndex<'a>>,
@@ -1780,7 +1774,7 @@ fn get_sequence_mut(seq_state: &mut SequencesState, seq_id: SequenceId) -> Resul
         .ok_or_else(|| SequenceError::NotFound(seq_id).into())
 }
 
-fn get_next_sequence_value(
+pub(super) fn get_next_sequence_value(
     tx_state: &mut TxState,
     committed_state: &CommittedState,
     seq_state: &mut SequencesState,
@@ -2347,7 +2341,7 @@ pub enum RowRefInsertion<'a> {
 impl<'a> RowRefInsertion<'a> {
     /// Returns a row,
     /// collapsing the distinction between inserted and existing rows.
-    pub(super) fn collapse(&self) -> RowRef<'a> {
+    pub fn collapse(&self) -> RowRef<'a> {
         let (Self::Inserted(row) | Self::Existed(row)) = *self;
         row
     }
@@ -2923,7 +2917,7 @@ impl MutTxId {
 /// - the number of bytes added to the tx blob store.
 /// - The "tx table for insertion" for further processing.
 /// - The "commit table for insertion" for further processing.
-fn insert_physically_maybe_generate<'a, const GENERATE: bool>(
+pub(super) fn insert_physically_maybe_generate<'a, const GENERATE: bool>(
     tx_state: &'a mut TxState,
     committed_state: &'a CommittedState,
     seq_state: &mut SequencesState,
@@ -3119,6 +3113,194 @@ pub(super) fn insert<'a, const GENERATE: bool>(
     }
 }
 
+pub(super) fn update<'a>(
+    tx_state: &'a mut TxState,
+    committed_state: &'a CommittedState,
+    seq_state: &mut SequencesState,
+    table_id: TableId,
+    index_id: IndexId,
+    row: &[u8],
+) -> Result<(ColList, RowRefInsertion<'a>, UpdateFlags)> {
+    // Insert the physical row into the tx insert table
+    // and possibly generate sequence values.
+    //
+    // As we are provided the `row` encoded in BSATN,
+    // and since we don't have a convenient way to BSATN to a set of columns,
+    // we cannot really do an in-place update in the row-was-in-tx-state case.
+    // So we will begin instead by inserting the row physically to the tx state and project that.
+    let (
+        tx_row_ptr,
+        cols_to_gen,
+        blob_bytes,
+        (tx_table, tx_blob_store, del_table),
+        (commit_table, commit_blob_store, _),
+    ) = insert_physically_maybe_generate::<true>(
+        tx_state,
+        committed_state,
+        seq_state,
+        table_id,
+        row,
+    )?;
+
+    let update_flags = UpdateFlags {
+        is_scheduler_table: tx_table.is_scheduler(),
+    };
+    let ok = |row_ref| Ok((cols_to_gen, row_ref, update_flags));
+
+    // SAFETY: `tx_table.is_row_present(tx_row_ptr)` holds as we just inserted it.
+    let tx_row_ref = unsafe { tx_table.get_row_ref_unchecked(tx_blob_store, tx_row_ptr) };
+
+    let err = 'error: {
+        // This macros can be thought of as a `throw $e` within `'error`.
+        // TODO(centril): Get rid of this once we have stable `try` blocks or polonius.
+        macro_rules! throw {
+            ($e:expr) => {
+                break 'error $e.into()
+            };
+        }
+
+        // Check that the index exists and is unique.
+        // It's sufficient to check the committed state.
+        let Some(commit_index) = commit_table.get_index_by_id(index_id) else {
+            throw!(IndexError::NotFound(index_id));
+        };
+        if !commit_index.is_unique() {
+            throw!(IndexError::NotUnique(index_id));
+        }
+
+        // Derive the key of `tx_row_ref` for `commit_index`.
+        // SAFETY: `tx_row_ref`'s table is derived from `commit_index`'s table,
+        // so the row layouts match and thus,
+        // `commit_index`'s key type is the same as the type of `row_ref`
+        // projected to `commit_index.indexed_columns`.
+        let index_key = unsafe { commit_index.key_from_row(tx_row_ref) };
+
+        // Try to find the old row first in the committed state using the `index_key`.
+        let mut old_commit_del_ptr = None;
+        let commit_old_ptr = commit_index.seek_point(&index_key).next().filter(|&ptr| {
+            // Was committed row previously deleted in this TX?
+            let deleted = del_table.contains(ptr);
+            // If so, remember it in case it was identical to the new row.
+            old_commit_del_ptr = deleted.then_some(ptr);
+            !deleted
+        });
+
+        // Ensure that the new row does not violate other commit table unique constraints.
+        let is_deleted = |commit_ptr| {
+            commit_old_ptr.is_some_and(|old_ptr| old_ptr == commit_ptr) || del_table.contains(commit_ptr)
+        };
+        // SAFETY: `commit_table.row_layout() == new_row.row_layout()` holds
+        // as the `tx_table` is derived from `commit_table`.
+        if let Err(e) = unsafe {
+            commit_table.check_unique_constraints(
+                tx_row_ref,
+                // Don't check this index since we'll do a 1-1 old/new replacement.
+                |ixs| ixs.filter(|&(&id, _)| id != index_id),
+                is_deleted,
+            )
+        } {
+            throw!(IndexError::from(e));
+        }
+
+        let tx_row_ptr = if let Some(old_ptr) = commit_old_ptr {
+            // Row was found in the committed state!
+            //
+            // If the new row is the same as the old,
+            // skip the update altogether to match the semantics of `Self::insert`.
+            //
+            // SAFETY:
+            // 1. `tx_table` is derived from `commit_table` so they have the same layouts.
+            // 2. `old_ptr` was found in an index of `commit_table`, so we know it is valid.
+            // 3. we just inserted `tx_row_ptr` into `tx_table`, so we know it is valid.
+            if unsafe { Table::eq_row_in_page(commit_table, old_ptr, tx_table, tx_row_ptr) } {
+                // SAFETY: `tx_table.is_row_present(tx_row_ptr)` holds, as noted in 3.
+                unsafe { tx_table.delete_internal_skip_pointer_map(tx_blob_store, tx_row_ptr) };
+                // SAFETY: `commit_table.is_row_present(old_ptr)` holds, as noted in 2.
+                let row_ref = unsafe { commit_table.get_row_ref_unchecked(commit_blob_store, old_ptr) };
+                return ok(RowRefInsertion::Existed(row_ref));
+            }
+
+            // Check constraints and confirm the insertion of the new row.
+            //
+            // `CHECK_SAME_ROW = false`,
+            // as we know there's a row (`old_ptr`) in the committed state with,
+            // for columns `C`, a unique value X.
+            // For `row` to be identical to another row in the tx state,
+            // it must have the value `X` for `C`,
+            // but it cannot, as the committed state already has `X` for `C`.
+            // So we don't need to check the tx state for a duplicate row.
+            //
+            // SAFETY: `tx_table.is_row_present(row)` holds as we still haven't deleted the row,
+            // in particular, the `write_gen_val_to_col` call does not remove the row.
+            // On error, `tx_row_ptr` has already been removed, so don't do it again.
+            let (_, tx_row_ptr) =
+                unsafe { tx_table.confirm_insertion::<false>(tx_blob_store, tx_row_ptr, blob_bytes) }?;
+
+            // Delete the old row.
+            del_table.insert(old_ptr);
+            tx_row_ptr
+        } else if let Some(old_ptr) = tx_table
+            .get_index_by_id(index_id)
+            .and_then(|index| index.seek_point(&index_key).next())
+        {
+            // Row was found in the tx state!
+            //
+            // Check constraints and confirm the update of the new row.
+            // This ensures that the old row is removed from the indices
+            // before attempting to insert the new row into the indices.
+            //
+            // SAFETY: `tx_table.is_row_present(tx_row_ptr)` and `tx_table.is_row_present(old_ptr)` both hold
+            // as we've deleted neither.
+            // In particular, the `write_gen_val_to_col` call does not remove the row.
+            let tx_row_ptr = unsafe { tx_table.confirm_update(tx_blob_store, tx_row_ptr, old_ptr, blob_bytes) }?;
+
+            if let Some(old_commit_del_ptr) = old_commit_del_ptr {
+                // If we have an identical deleted row in the committed state,
+                // we need to undelete it, just like in `Self::insert`.
+                // The same note (`insert_undelete`) there re. MVCC applies here as well.
+                //
+                // SAFETY:
+                // 1. `tx_table` is derived from `commit_table` so they have the same layouts.
+                // 2. `old_commit_del_ptr` was found in an index of `commit_table`.
+                // 3. we just inserted `tx_row_ptr` into `tx_table`, so we know it is valid.
+                if unsafe { Table::eq_row_in_page(commit_table, old_commit_del_ptr, tx_table, tx_row_ptr) } {
+                    // It is important that we `confirm_update` first,
+                    // as we must ensure that undeleting the row causes no tx state conflict.
+                    tx_table
+                        .delete(tx_blob_store, tx_row_ptr, |_| ())
+                        .expect("Failed to delete a row we just inserted");
+
+                    // Undelete.
+                    del_table.remove(old_commit_del_ptr);
+
+                    // Return the undeleted committed state row.
+                    // SAFETY: `commit_table.is_row_present(old_commit_del_ptr)` holds.
+                    let row_ref =
+                        unsafe { commit_table.get_row_ref_unchecked(commit_blob_store, old_commit_del_ptr) };
+                    return ok(RowRefInsertion::Existed(row_ref));
+                }
+            }
+
+            tx_row_ptr
+        } else {
+            let index_key = commit_index.project_row(tx_row_ref);
+            throw!(IndexError::KeyNotFound(index_id, index_key));
+        };
+
+        // SAFETY: `tx_table.is_row_present(tx_row_ptr)` holds
+        // per post-condition of `confirm_insertion` and `confirm_update`
+        // in the if/else branches respectively.
+        let row_ref = unsafe { tx_table.get_row_ref_unchecked(tx_blob_store, tx_row_ptr) };
+        return ok(RowRefInsertion::Inserted(row_ref));
+    };
+
+    // When we reach here, we had an error and we need to revert the insertion of `tx_row_ref`.
+    // SAFETY: `tx_table.is_row_present(tx_row_ptr)` holds,
+    // as we still haven't deleted the row physically.
+    unsafe { tx_table.delete_internal_skip_pointer_map(tx_blob_store, tx_row_ptr) };
+    Err(err)
+}
+
 impl MutTxId {
     /// Update a row, encoded in BSATN, into a table.
     ///
@@ -3142,184 +3324,14 @@ impl MutTxId {
         index_id: IndexId,
         row: &[u8],
     ) -> Result<(ColList, RowRefInsertion<'_>, UpdateFlags)> {
-        // Insert the physical row into the tx insert table
-        // and possibly generate sequence values.
-        //
-        // As we are provided the `row` encoded in BSATN,
-        // and since we don't have a convenient way to BSATN to a set of columns,
-        // we cannot really do an in-place update in the row-was-in-tx-state case.
-        // So we will begin instead by inserting the row physically to the tx state and project that.
-        let (
-            tx_row_ptr,
-            cols_to_gen,
-            blob_bytes,
-            (tx_table, tx_blob_store, del_table),
-            (commit_table, commit_blob_store, _),
-        ) = insert_physically_maybe_generate::<true>(
+        update(
             &mut self.tx_state,
             &self.committed_state_write_lock,
             &mut self.sequence_state_lock,
             table_id,
+            index_id,
             row,
-        )?;
-
-        let update_flags = UpdateFlags {
-            is_scheduler_table: tx_table.is_scheduler(),
-        };
-        let ok = |row_ref| Ok((cols_to_gen, row_ref, update_flags));
-
-        // SAFETY: `tx_table.is_row_present(tx_row_ptr)` holds as we just inserted it.
-        let tx_row_ref = unsafe { tx_table.get_row_ref_unchecked(tx_blob_store, tx_row_ptr) };
-
-        let err = 'error: {
-            // This macros can be thought of as a `throw $e` within `'error`.
-            // TODO(centril): Get rid of this once we have stable `try` blocks or polonius.
-            macro_rules! throw {
-                ($e:expr) => {
-                    break 'error $e.into()
-                };
-            }
-
-            // Check that the index exists and is unique.
-            // It's sufficient to check the committed state.
-            let Some(commit_index) = commit_table.get_index_by_id(index_id) else {
-                throw!(IndexError::NotFound(index_id));
-            };
-            if !commit_index.is_unique() {
-                throw!(IndexError::NotUnique(index_id));
-            }
-
-            // Derive the key of `tx_row_ref` for `commit_index`.
-            // SAFETY: `tx_row_ref`'s table is derived from `commit_index`'s table,
-            // so the row layouts match and thus,
-            // `commit_index`'s key type is the same as the type of `row_ref`
-            // projected to `commit_index.indexed_columns`.
-            let index_key = unsafe { commit_index.key_from_row(tx_row_ref) };
-
-            // Try to find the old row first in the committed state using the `index_key`.
-            let mut old_commit_del_ptr = None;
-            let commit_old_ptr = commit_index.seek_point(&index_key).next().filter(|&ptr| {
-                // Was committed row previously deleted in this TX?
-                let deleted = del_table.contains(ptr);
-                // If so, remember it in case it was identical to the new row.
-                old_commit_del_ptr = deleted.then_some(ptr);
-                !deleted
-            });
-
-            // Ensure that the new row does not violate other commit table unique constraints.
-            let is_deleted = |commit_ptr| {
-                commit_old_ptr.is_some_and(|old_ptr| old_ptr == commit_ptr) || del_table.contains(commit_ptr)
-            };
-            // SAFETY: `commit_table.row_layout() == new_row.row_layout()` holds
-            // as the `tx_table` is derived from `commit_table`.
-            if let Err(e) = unsafe {
-                commit_table.check_unique_constraints(
-                    tx_row_ref,
-                    // Don't check this index since we'll do a 1-1 old/new replacement.
-                    |ixs| ixs.filter(|&(&id, _)| id != index_id),
-                    is_deleted,
-                )
-            } {
-                throw!(IndexError::from(e));
-            }
-
-            let tx_row_ptr = if let Some(old_ptr) = commit_old_ptr {
-                // Row was found in the committed state!
-                //
-                // If the new row is the same as the old,
-                // skip the update altogether to match the semantics of `Self::insert`.
-                //
-                // SAFETY:
-                // 1. `tx_table` is derived from `commit_table` so they have the same layouts.
-                // 2. `old_ptr` was found in an index of `commit_table`, so we know it is valid.
-                // 3. we just inserted `tx_row_ptr` into `tx_table`, so we know it is valid.
-                if unsafe { Table::eq_row_in_page(commit_table, old_ptr, tx_table, tx_row_ptr) } {
-                    // SAFETY: `tx_table.is_row_present(tx_row_ptr)` holds, as noted in 3.
-                    unsafe { tx_table.delete_internal_skip_pointer_map(tx_blob_store, tx_row_ptr) };
-                    // SAFETY: `commit_table.is_row_present(old_ptr)` holds, as noted in 2.
-                    let row_ref = unsafe { commit_table.get_row_ref_unchecked(commit_blob_store, old_ptr) };
-                    return ok(RowRefInsertion::Existed(row_ref));
-                }
-
-                // Check constraints and confirm the insertion of the new row.
-                //
-                // `CHECK_SAME_ROW = false`,
-                // as we know there's a row (`old_ptr`) in the committed state with,
-                // for columns `C`, a unique value X.
-                // For `row` to be identical to another row in the tx state,
-                // it must have the value `X` for `C`,
-                // but it cannot, as the committed state already has `X` for `C`.
-                // So we don't need to check the tx state for a duplicate row.
-                //
-                // SAFETY: `tx_table.is_row_present(row)` holds as we still haven't deleted the row,
-                // in particular, the `write_gen_val_to_col` call does not remove the row.
-                // On error, `tx_row_ptr` has already been removed, so don't do it again.
-                let (_, tx_row_ptr) =
-                    unsafe { tx_table.confirm_insertion::<false>(tx_blob_store, tx_row_ptr, blob_bytes) }?;
-
-                // Delete the old row.
-                del_table.insert(old_ptr);
-                tx_row_ptr
-            } else if let Some(old_ptr) = tx_table
-                .get_index_by_id(index_id)
-                .and_then(|index| index.seek_point(&index_key).next())
-            {
-                // Row was found in the tx state!
-                //
-                // Check constraints and confirm the update of the new row.
-                // This ensures that the old row is removed from the indices
-                // before attempting to insert the new row into the indices.
-                //
-                // SAFETY: `tx_table.is_row_present(tx_row_ptr)` and `tx_table.is_row_present(old_ptr)` both hold
-                // as we've deleted neither.
-                // In particular, the `write_gen_val_to_col` call does not remove the row.
-                let tx_row_ptr = unsafe { tx_table.confirm_update(tx_blob_store, tx_row_ptr, old_ptr, blob_bytes) }?;
-
-                if let Some(old_commit_del_ptr) = old_commit_del_ptr {
-                    // If we have an identical deleted row in the committed state,
-                    // we need to undelete it, just like in `Self::insert`.
-                    // The same note (`insert_undelete`) there re. MVCC applies here as well.
-                    //
-                    // SAFETY:
-                    // 1. `tx_table` is derived from `commit_table` so they have the same layouts.
-                    // 2. `old_commit_del_ptr` was found in an index of `commit_table`.
-                    // 3. we just inserted `tx_row_ptr` into `tx_table`, so we know it is valid.
-                    if unsafe { Table::eq_row_in_page(commit_table, old_commit_del_ptr, tx_table, tx_row_ptr) } {
-                        // It is important that we `confirm_update` first,
-                        // as we must ensure that undeleting the row causes no tx state conflict.
-                        tx_table
-                            .delete(tx_blob_store, tx_row_ptr, |_| ())
-                            .expect("Failed to delete a row we just inserted");
-
-                        // Undelete.
-                        del_table.remove(old_commit_del_ptr);
-
-                        // Return the undeleted committed state row.
-                        // SAFETY: `commit_table.is_row_present(old_commit_del_ptr)` holds.
-                        let row_ref =
-                            unsafe { commit_table.get_row_ref_unchecked(commit_blob_store, old_commit_del_ptr) };
-                        return ok(RowRefInsertion::Existed(row_ref));
-                    }
-                }
-
-                tx_row_ptr
-            } else {
-                let index_key = commit_index.project_row(tx_row_ref);
-                throw!(IndexError::KeyNotFound(index_id, index_key));
-            };
-
-            // SAFETY: `tx_table.is_row_present(tx_row_ptr)` holds
-            // per post-condition of `confirm_insertion` and `confirm_update`
-            // in the if/else branches respectively.
-            let row_ref = unsafe { tx_table.get_row_ref_unchecked(tx_blob_store, tx_row_ptr) };
-            return ok(RowRefInsertion::Inserted(row_ref));
-        };
-
-        // When we reach here, we had an error and we need to revert the insertion of `tx_row_ref`.
-        // SAFETY: `tx_table.is_row_present(tx_row_ptr)` holds,
-        // as we still haven't deleted the row physically.
-        unsafe { tx_table.delete_internal_skip_pointer_map(tx_blob_store, tx_row_ptr) };
-        Err(err)
+        )
     }
 
     pub(super) fn delete(&mut self, table_id: TableId, row_pointer: RowPointer) -> Result<bool> {
@@ -3481,7 +3493,7 @@ impl StateView for MutTxId {
     }
 }
 
-fn table_row_count(tx_state: &TxState, committed_state: &CommittedState, table_id: TableId) -> Option<u64> {
+pub(super) fn table_row_count(tx_state: &TxState, committed_state: &CommittedState, table_id: TableId) -> Option<u64> {
     let commit_count = committed_state.table_row_count(table_id);
     let (tx_ins_count, tx_del_count) = tx_state.table_row_count(table_id);
     let commit_count = commit_count.map(|cc| cc - tx_del_count);
@@ -3493,11 +3505,11 @@ fn table_row_count(tx_state: &TxState, committed_state: &CommittedState, table_i
     }
 }
 
-fn iter<'a>(tx_state: &'a TxState, committed_state: &'a CommittedState, table_id: TableId) -> Result<IterMutTx<'a>> {
+pub(super) fn iter<'a>(tx_state: &'a TxState, committed_state: &'a CommittedState, table_id: TableId) -> Result<IterMutTx<'a>> {
     IterMutTx::new(table_id, tx_state, committed_state)
 }
 
-fn iter_by_col_range<'a, R: RangeBounds<AlgebraicValue>>(
+pub(super) fn iter_by_col_range<'a, R: RangeBounds<AlgebraicValue>>(
     tx_state: &'a TxState,
     committed_state: &'a CommittedState,
     table_id: TableId,
@@ -3542,7 +3554,7 @@ fn unindexed_iter_by_col_range_warn(
     }
 }
 
-fn iter_by_col_eq<'a, 'r>(
+pub(super) fn iter_by_col_eq<'a, 'r>(
     tx_state: &'a TxState,
     committed_state: &'a CommittedState,
     table_id: TableId,

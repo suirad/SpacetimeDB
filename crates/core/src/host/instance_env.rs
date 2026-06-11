@@ -1,6 +1,6 @@
 use super::scheduler::{get_schedule_from_row, ScheduleError, Scheduler};
 use crate::database_logger::{BacktraceFrame, BacktraceProvider, LogLevel, ModuleBacktrace, Record};
-use crate::db::relational_db::{MutTx, RelationalDB};
+use crate::db::relational_db::RelationalDB;
 use crate::error::{DBError, DatastoreError, IndexError, NodesError};
 use crate::host::module_host::{DatabaseUpdate, EventStatus, ModuleEvent, ModuleFunctionCall};
 use crate::host::wasm_common::TimingSpan;
@@ -17,7 +17,8 @@ use spacetimedb_client_api_messages::energy::FunctionBudget;
 use spacetimedb_datastore::db_metrics::DB_METRICS;
 use spacetimedb_datastore::execution_context::Workload;
 use spacetimedb_datastore::locking_tx_datastore::state_view::StateView;
-use spacetimedb_datastore::locking_tx_datastore::{FuncCallType, IndexScanPointOrRange, MutTxId};
+use spacetimedb_datastore::locking_tx_datastore::{FuncCallType, IndexScanPointOrRange, MutTxId, ReducerTxVariant};
+use spacetimedb_datastore::ReducerTx;
 use spacetimedb_datastore::traits::IsolationLevel;
 use spacetimedb_lib::{http as st_http, ConnectionId, Identity, Timestamp};
 use spacetimedb_primitives::{ColId, ColList, IndexId, TableId};
@@ -80,10 +81,12 @@ pub struct InstanceEnv {
 ///
 /// # Safety
 ///
-/// `InstanceEnv` doesn't auto-derive `Send` because it may hold a `MutTxId`,
-/// which we've manually made `!Send` to preserve logical invariants.
-/// As described above, sending an `InstanceEnv` while it holds a `MutTxId` will violate logical invariants,
-/// but this is not a safety concern.
+/// `InstanceEnv` doesn't auto-derive `Send` because its [`TxSlot`] may hold a
+/// [`ReducerTxVariant::Mut`], whose `MutTxId` we've manually made `!Send` to preserve
+/// logical invariants. (The `Batch` variant is `Send`, but the slot is `!Send` as long
+/// as either variant can be `Mut`.)
+/// As described above, sending an `InstanceEnv` while it holds a `MutTxId` will violate
+/// logical invariants, but this is not a safety concern.
 /// Transferring a `MutTxId` between threads will never cause Undefined Behavior,
 /// though it is likely to lead to deadlocks.
 unsafe impl Send for InstanceEnv {}
@@ -91,7 +94,7 @@ unsafe impl Send for InstanceEnv {}
 #[derive(Clone, Default)]
 pub struct TxSlot {
     // Wrapped in Mutex for interior mutability.
-    inner: Arc<Mutex<Option<MutTxId>>>,
+    inner: Arc<Mutex<Option<ReducerTxVariant>>>,
 }
 
 /// The maximum number of chunks stored in a single [`ChunkPool`].
@@ -264,7 +267,7 @@ impl InstanceEnv {
         mem::replace(&mut self.func_type, func_type)
     }
 
-    fn get_tx(&self) -> Result<impl DerefMut<Target = MutTxId> + '_, GetTxError> {
+    fn get_tx(&self) -> Result<impl DerefMut<Target = ReducerTxVariant> + '_, GetTxError> {
         self.tx.get()
     }
 
@@ -282,8 +285,8 @@ impl InstanceEnv {
     }
 
     pub(crate) fn get_jwt_payload(&self, connection_id: ConnectionId) -> Result<Option<String>, NodesError> {
-        let tx = &mut *self.get_tx()?;
-        Ok(tx.get_jwt_payload(connection_id).map_err(DBError::from)?)
+        let tx = &*self.get_tx()?;
+        Ok(ReducerTx::get_jwt_payload(tx, connection_id).map_err(DBError::from)?)
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -371,8 +374,7 @@ impl InstanceEnv {
                 |e| match e {
                     DBError::Datastore(DatastoreError::Index(IndexError::UniqueConstraintViolation(_))) => {}
                     _ => {
-                        let res = stdb.table_name_from_id_mut(tx, table_id);
-                        if let Ok(Some(table_name)) = res {
+                        if let Some(table_name) = tx.table_name(table_id) {
                             log::debug!("insert(table: {table_name}, table_id: {table_id}): {e}")
                         } else {
                             log::debug!("insert(table_id: {table_id}): {e}")
@@ -389,7 +391,7 @@ impl InstanceEnv {
 
         // Note, we update the metric for bytes written after the insert.
         // This is to capture auto-inc columns.
-        tx.metrics.bytes_written += buffer.len();
+        tx.metrics_mut().bytes_written += buffer.len();
 
         Ok(row_len)
     }
@@ -399,12 +401,12 @@ impl InstanceEnv {
     fn schedule_row(
         &self,
         stdb: &RelationalDB,
-        tx: &mut MutTx,
+        tx: &mut impl ReducerTx,
         table_id: TableId,
         row_ptr: RowPointer,
     ) -> Result<(), NodesError> {
         let function_name: Arc<str> = {
-            let table = stdb.schema_for_table_mut(tx, table_id)?;
+            let table = ReducerTx::schema_for_table(tx, table_id).map_err(DBError::from)?;
             let schedule = table
                 .schedule
                 .as_ref()
@@ -415,7 +417,7 @@ impl InstanceEnv {
             .table_scheduled_id_and_at(tx, table_id)?
             .expect("schedule_row should only be called when we know its a scheduler table");
 
-        let row_ref = tx.get(table_id, row_ptr).map_err(DBError::from)?.unwrap();
+        let row_ref = ReducerTx::get(tx, table_id, row_ptr).map_err(DBError::from)?.unwrap();
         let (schedule_id, schedule_at) = get_schedule_from_row(&row_ref, id_column, at_column)
             // NOTE(centril): Should never happen,
             // as we successfully inserted and thus `ret` is verified against the table schema.
@@ -451,8 +453,7 @@ impl InstanceEnv {
                 |e| match e {
                     DBError::Datastore(DatastoreError::Index(IndexError::UniqueConstraintViolation(_))) => {}
                     _ => {
-                        let res = stdb.table_name_from_id_mut(tx, table_id);
-                        if let Ok(Some(table_name)) = res {
+                        if let Some(table_name) = tx.table_name(table_id) {
                             log::debug!("update(table: {table_name}, table_id: {table_id}, index_id: {index_id}): {e}")
                         } else {
                             log::debug!("update(table_id: {table_id}, index_id: {index_id}): {e}")
@@ -467,8 +468,9 @@ impl InstanceEnv {
 
         tx.record_table_write(&self.func_type, table_id);
 
-        tx.metrics.bytes_written += buffer.len();
-        tx.metrics.rows_updated += 1;
+        let metrics = tx.metrics_mut();
+        metrics.bytes_written += buffer.len();
+        metrics.rows_updated += 1;
 
         Ok(row_len)
     }
@@ -521,7 +523,7 @@ impl InstanceEnv {
     /// and assumes `rows_to_delete` came from an index scan.
     fn datastore_delete_by_index_scan(
         stdb: &RelationalDB,
-        tx: &mut MutTxId,
+        tx: &mut impl ReducerTx,
         table_id: TableId,
         rows_to_delete: SmallVec<[RowPointer; 1]>,
     ) -> u32 {
@@ -530,8 +532,9 @@ impl InstanceEnv {
         //
         // Note that we're not updating `bytes_scanned` at all,
         // because we never dereference any of the returned `RowPointer`s.
-        tx.metrics.index_seeks += 1;
-        tx.metrics.rows_scanned += rows_to_delete.len();
+        let metrics = tx.metrics_mut();
+        metrics.index_seeks += 1;
+        metrics.rows_scanned += rows_to_delete.len();
 
         // Delete them and count how many we deleted.
         stdb.delete(tx, table_id, rows_to_delete)
@@ -551,7 +554,7 @@ impl InstanceEnv {
         let tx = &mut *self.get_tx()?;
 
         // Track the number of bytes coming from the caller
-        tx.metrics.bytes_scanned += relation.len();
+        tx.metrics_mut().bytes_scanned += relation.len();
 
         // Find the row schema using it to decode a vector of product values.
         let row_ty = stdb.row_schema_for_table(tx, table_id)?;
@@ -562,7 +565,7 @@ impl InstanceEnv {
         // Note, we track the number of rows coming from the caller,
         // regardless of whether or not we actually delete them,
         // since we have to derive row ids for each one of them.
-        tx.metrics.rows_scanned += relation.len();
+        tx.metrics_mut().rows_scanned += relation.len();
 
         // Delete them and return how many we deleted.
         let deleted = stdb.delete_by_rel(tx, table_id, relation);
@@ -579,7 +582,7 @@ impl InstanceEnv {
 
         // To clear a table, we must find all the row pointers,
         // so we have scanned that many rows.
-        tx.metrics.rows_scanned += rows_deleted as usize;
+        tx.metrics_mut().rows_scanned += rows_deleted as usize;
         tx.record_table_write(&self.func_type, table_id);
 
         Ok(rows_deleted)
@@ -645,8 +648,9 @@ impl InstanceEnv {
         let (chunks, rows_scanned, bytes_scanned) = ChunkedWriter::collect_iter(pool, iter);
 
         // Record the number of rows and the number of bytes scanned by the iterator.
-        tx.metrics.bytes_scanned += bytes_scanned;
-        tx.metrics.rows_scanned += rows_scanned;
+        let metrics = tx.metrics_mut();
+        metrics.bytes_scanned += bytes_scanned;
+        metrics.rows_scanned += rows_scanned;
 
         tx.record_table_scan(&self.func_type, table_id);
 
@@ -669,9 +673,10 @@ impl InstanceEnv {
         let (chunks, rows_scanned, bytes_scanned) = ChunkedWriter::collect_iter(pool, iter);
 
         // Record the number of rows and the number of bytes scanned by the iterator.
-        tx.metrics.index_seeks += 1;
-        tx.metrics.bytes_scanned += bytes_scanned;
-        tx.metrics.rows_scanned += rows_scanned;
+        let metrics = tx.metrics_mut();
+        metrics.index_seeks += 1;
+        metrics.bytes_scanned += bytes_scanned;
+        metrics.rows_scanned += rows_scanned;
 
         tx.record_index_scan_point(&self.func_type, table_id, index_id, point);
 
@@ -702,9 +707,10 @@ impl InstanceEnv {
         };
 
         // Record the number of rows and the number of bytes scanned by the iterator.
-        tx.metrics.index_seeks += 1;
-        tx.metrics.bytes_scanned += bytes_scanned;
-        tx.metrics.rows_scanned += rows_scanned;
+        let metrics = tx.metrics_mut();
+        metrics.index_seeks += 1;
+        metrics.bytes_scanned += bytes_scanned;
+        metrics.rows_scanned += rows_scanned;
 
         tx.record_index_scan_range(&self.func_type, table_id, index_id, point);
 
@@ -1299,7 +1305,7 @@ fn convert_http_response(response: http::response::Parts) -> st_http::Response {
 impl TxSlot {
     /// Sets the slot to `tx`, ensuring that there was no tx before.
     pub fn set_raw(&mut self, tx: MutTxId) {
-        let prev = self.inner.lock().replace(tx);
+        let prev = self.inner.lock().replace(ReducerTxVariant::Mut(tx));
         assert!(prev.is_none(), "reentrant TxSlot::set");
     }
 
@@ -1319,13 +1325,19 @@ impl TxSlot {
     }
 
     /// Returns the tx in the slot.
-    pub fn get(&self) -> Result<impl DerefMut<Target = MutTxId> + '_, GetTxError> {
+    pub fn get(&self) -> Result<impl DerefMut<Target = ReducerTxVariant> + '_, GetTxError> {
         MutexGuard::try_map(self.inner.lock(), |map| map.as_mut()).map_err(|_| GetTxError)
     }
 
     /// Steals the tx from the slot.
+    ///
+    /// Panics if the slot held a non-`Mut` variant. This is impossible by construction
+    /// today: only `set_raw` writes the slot and it only ever writes `Mut`.
     pub fn take(&self) -> Result<MutTxId, GetTxError> {
-        self.inner.lock().take().ok_or(GetTxError)
+        match self.inner.lock().take().ok_or(GetTxError)? {
+            ReducerTxVariant::Mut(tx) => Ok(tx),
+            ReducerTxVariant::Batch(_) => panic!("TxSlot::take expected a `Mut` variant"),
+        }
     }
 }
 

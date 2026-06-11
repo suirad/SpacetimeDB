@@ -14,7 +14,7 @@ use crate::system_tables::{
 use anyhow::anyhow;
 use core::ops::RangeBounds;
 use spacetimedb_lib::ConnectionId;
-use spacetimedb_primitives::{ColList, TableId};
+use spacetimedb_primitives::{ColList, IndexId, TableId};
 use spacetimedb_sats::AlgebraicValue;
 use spacetimedb_schema::schema::{ColumnSchema, IndexSchema, TableSchema, ViewDefInfo};
 use spacetimedb_table::table::IndexScanPointIter;
@@ -54,6 +54,26 @@ pub trait StateView {
             return Ok(None);
         };
         self.table_id_from_name(&row.table_name)
+    }
+
+    /// Looks up an index id by the index's canonical name or its accessor/alias name.
+    fn index_id_from_name_or_alias(&self, index_name_or_alias: &str) -> Result<Option<IndexId>> {
+        let name_av = &<Box<str>>::from(index_name_or_alias).into();
+        if let Some(id) = self
+            .iter_by_col_eq(ST_INDEX_ID, StIndexFields::IndexName, name_av)?
+            .next()
+            .map(|r| r.read_col(StIndexFields::IndexId).unwrap())
+        {
+            return Ok(Some(id));
+        }
+        let Some(row) = self.find_st_index_accessor_row(index_name_or_alias)? else {
+            return Ok(None);
+        };
+        let canonical_av = &<Box<str>>::from(row.index_name.as_ref()).into();
+        Ok(self
+            .iter_by_col_eq(ST_INDEX_ID, StIndexFields::IndexName, canonical_av)?
+            .next()
+            .map(|r| r.read_col(StIndexFields::IndexId).unwrap()))
     }
 
     /// Returns the number of rows in the table identified by `table_id`.

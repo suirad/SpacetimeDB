@@ -16,6 +16,11 @@ mod tx_state;
 #[cfg(any(test, feature = "test"))]
 pub use tx_state::PendingSchemaChange;
 
+pub mod batch_tx;
+pub use batch_tx::{BatchTxState, FinishedBatchTx};
+mod reducer_tx;
+pub use reducer_tx::{ReducerTx, ReducerTxVariant};
+
 use parking_lot::{
     lock_api::{ArcMutexGuard, ArcRwLockReadGuard, ArcRwLockWriteGuard},
     RawMutex, RawRwLock,

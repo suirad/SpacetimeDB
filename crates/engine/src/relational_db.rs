@@ -19,6 +19,7 @@ use spacetimedb_datastore::locking_tx_datastore::state_view::{
 use spacetimedb_datastore::locking_tx_datastore::{
     ApplyHistoryCounters, IndexScanPointOrRange, MutTxId, TxId, ViewCallInfo,
 };
+use spacetimedb_datastore::ReducerTx;
 use spacetimedb_datastore::system_tables::{
     system_tables, StModuleRow, ST_CLIENT_ID, ST_CONNECTION_CREDENTIALS_ID, ST_VIEW_SUB_ID,
 };
@@ -700,10 +701,10 @@ impl RelationalDB {
 
     pub fn row_schema_for_table<'tx>(
         &self,
-        tx: &'tx MutTx,
+        tx: &'tx impl ReducerTx,
         table_id: TableId,
     ) -> Result<RowTypeForTable<'tx>, DBError> {
-        Ok(self.inner.row_type_for_table_mut_tx(tx, table_id)?)
+        Ok(tx.row_type_for_table(table_id)?)
     }
 
     pub fn get_all_tables_mut(&self, tx: &MutTx) -> Result<Vec<Arc<TableSchema>>, DBError> {
@@ -1260,8 +1261,8 @@ impl RelationalDB {
         Ok(self.inner.view_id_from_name_mut_tx(tx, view_name)?)
     }
 
-    pub fn table_id_from_name_mut(&self, tx: &MutTx, table_name: &str) -> Result<Option<TableId>, DBError> {
-        Ok(self.inner.table_id_from_name_mut_tx(tx, table_name)?)
+    pub fn table_id_from_name_mut(&self, tx: &impl ReducerTx, table_name: &str) -> Result<Option<TableId>, DBError> {
+        Ok(ReducerTx::table_id_from_name_or_alias(tx, table_name)?)
     }
 
     pub fn table_id_from_name(&self, tx: &Tx, table_name: &str) -> Result<Option<TableId>, DBError> {
@@ -1288,13 +1289,11 @@ impl RelationalDB {
         Ok(self.inner.table_name_from_id_mut_tx(tx, table_id)?)
     }
 
-    pub fn index_id_from_name_mut(&self, tx: &MutTx, index_name: &str) -> Result<Option<IndexId>, DBError> {
-        Ok(self.inner.index_id_from_name_mut_tx(tx, index_name)?)
+    pub fn index_id_from_name_mut(&self, tx: &impl ReducerTx, index_name: &str) -> Result<Option<IndexId>, DBError> {
+        Ok(ReducerTx::index_id_from_name_or_alias(tx, index_name)?)
     }
 
-    pub fn table_row_count_mut(&self, tx: &MutTx, table_id: TableId) -> Option<u64> {
-        // TODO(Centril): Go via MutTxDatastore trait instead.
-        // Doing this for now to ship this quicker.
+    pub fn table_row_count_mut(&self, tx: &impl ReducerTx, table_id: TableId) -> Option<u64> {
         tx.table_row_count(table_id)
     }
 
@@ -1370,8 +1369,11 @@ impl RelationalDB {
 
     /// Returns an iterator,
     /// yielding every row in the table identified by `table_id`.
-    pub fn iter_mut<'a>(&'a self, tx: &'a MutTx, table_id: TableId) -> Result<IterMutTx<'a>, DBError> {
-        Ok(self.inner.iter_mut_tx(tx, table_id)?)
+    pub fn iter_mut<'a, T>(&'a self, tx: &'a T, table_id: TableId) -> Result<IterMutTx<'a>, DBError>
+    where
+        T: ReducerTx + for<'b> StateView<Iter<'b> = IterMutTx<'b>>,
+    {
+        Ok(StateView::iter(tx, table_id)?)
     }
 
     pub fn iter<'a>(&'a self, tx: &'a Tx, table_id: TableId) -> Result<TableScanIter<'a>, DBError> {
@@ -1433,62 +1435,86 @@ impl RelationalDB {
         Ok(self.inner.iter_by_col_range_tx(tx, table_id.into(), cols, range)?)
     }
 
-    pub fn index_scan_range<'de, 'a>(
+    pub fn index_scan_range<'de, 'a, T: ReducerTx>(
         &'a self,
-        tx: &'a MutTx,
+        tx: &'a T,
         index_id: IndexId,
         prefix: &'de [u8],
         prefix_elems: ColId,
         rstart: &'de [u8],
         rend: &'de [u8],
-    ) -> Result<(TableId, IndexScanPointOrRange<'de, 'a>), DBError> {
+    ) -> Result<(TableId, IndexScanPointOrRange<'de, 'a>), DBError>
+    where
+        'de: 'a,
+    {
         Ok(tx.index_scan_range(index_id, prefix, prefix_elems, rstart, rend)?)
     }
 
-    pub fn index_scan_point<'a, 'p>(
+    pub fn index_scan_point<'a, 'p, T: ReducerTx>(
         &'a self,
-        tx: &'a MutTx,
+        tx: &'a T,
         index_id: IndexId,
         point: &'p [u8],
-    ) -> Result<(TableId, IndexKey<'p>, impl Iterator<Item = RowRef<'a>> + use<'a>), DBError> {
+    ) -> Result<(TableId, IndexKey<'p>, impl Iterator<Item = RowRef<'a>> + use<'a, 'p, T>), DBError> {
         Ok(tx.index_scan_point(index_id, point)?)
     }
 
-    pub fn insert<'a>(
+    pub fn insert<'a, T: ReducerTx>(
         &'a self,
-        tx: &'a mut MutTx,
+        tx: &'a mut T,
         table_id: TableId,
         row: &[u8],
     ) -> Result<(ColList, RowRef<'a>, InsertFlags), DBError> {
-        Ok(self.inner.insert_mut_tx(tx, table_id, row)?)
+        let (gens, row_ref, insert_flags) = tx.insert::<true>(table_id, row)?;
+        Ok((gens, row_ref.collapse(), insert_flags))
     }
 
-    pub fn update<'a>(
+    pub fn update<'a, T: ReducerTx>(
         &'a self,
-        tx: &'a mut MutTx,
+        tx: &'a mut T,
         table_id: TableId,
         index_id: IndexId,
         row: &[u8],
     ) -> Result<(ColList, RowRef<'a>, UpdateFlags), DBError> {
-        Ok(self.inner.update_mut_tx(tx, table_id, index_id, row)?)
+        let (gens, row_ref, update_flags) = tx.update(table_id, index_id, row)?;
+        Ok((gens, row_ref.collapse(), update_flags))
     }
 
-    pub fn delete(&self, tx: &mut MutTx, table_id: TableId, row_ids: impl IntoIterator<Item = RowPointer>) -> u32 {
-        self.inner.delete_mut_tx(tx, table_id, row_ids)
+    pub fn delete(
+        &self,
+        tx: &mut impl ReducerTx,
+        table_id: TableId,
+        row_ids: impl IntoIterator<Item = RowPointer>,
+    ) -> u32 {
+        let mut num_deleted = 0;
+        for row_ptr in row_ids {
+            match tx.delete(table_id, row_ptr) {
+                Err(e) => log::error!("delete_mut_tx: {e:?}"),
+                Ok(b) => num_deleted += b as u32,
+            }
+        }
+        num_deleted
     }
 
     pub fn delete_by_rel<R: IntoIterator<Item = ProductValue>>(
         &self,
-        tx: &mut MutTx,
+        tx: &mut impl ReducerTx,
         table_id: TableId,
         relation: R,
     ) -> u32 {
-        self.inner.delete_by_rel_mut_tx(tx, table_id, relation)
+        let mut num_deleted = 0;
+        for row in relation {
+            match tx.delete_by_row_value(table_id, &row) {
+                Err(e) => log::error!("delete_by_rel_mut_tx: {e:?}"),
+                Ok(b) => num_deleted += b as u32,
+            }
+        }
+        num_deleted
     }
 
     /// Clears all rows from a table without dropping it.
-    pub fn clear_table(&self, tx: &mut MutTx, table_id: TableId) -> Result<u64, DBError> {
-        let rows_deleted = tx.clear_table(table_id)?;
+    pub fn clear_table(&self, tx: &mut impl ReducerTx, table_id: TableId) -> Result<u64, DBError> {
+        let rows_deleted = ReducerTx::clear_table(tx, table_id)?;
         Ok(rows_deleted)
     }
 

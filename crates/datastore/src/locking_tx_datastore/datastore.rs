@@ -1,5 +1,10 @@
 use super::{
-    committed_state::CommittedState, mut_tx::MutTxId, sequence::SequencesState, state_view::StateView, tx::TxId,
+    batch_tx::{BatchTxState, FinishedBatchTx},
+    committed_state::CommittedState,
+    mut_tx::{MutTxId, ViewReadSets},
+    sequence::SequencesState,
+    state_view::StateView,
+    tx::TxId,
     tx_state::TxState,
 };
 use crate::execution_context::{Workload, WorkloadType};
@@ -986,6 +991,85 @@ impl Locking {
         before_downgrade: impl FnOnce(&Arc<TxData>),
     ) -> (Arc<TxData>, TxMetrics, TxId) {
         tx.commit_downgrade_and_then(workload, before_downgrade)
+    }
+
+    /// Begin a concurrent batch transaction.
+    ///
+    /// Acquires a shared read lock (not a write lock), so multiple batch
+    /// transactions may run concurrently. The sequence state is shared via
+    /// `Arc<Mutex<…>>` so sequence draws are safe across threads.
+    pub fn begin_batch_tx(&self, workload: Workload) -> BatchTxState {
+        let metrics = ExecutionMetrics::default();
+        let ctx = ExecutionContext::with_workload(self.database_identity, workload);
+
+        let timer = Instant::now();
+        let committed_state_read_lock = self.committed_state.read_arc();
+        let lock_wait_time = timer.elapsed();
+
+        BatchTxState {
+            tx_state: TxState::default(),
+            committed_state_read_lock,
+            sequence_state: Arc::clone(&self.sequence_state),
+            read_sets: ViewReadSets::default(),
+            lock_wait_time,
+            timer,
+            ctx,
+            metrics,
+            observed: None,
+        }
+    }
+
+    /// Commit a finished batch transaction.
+    ///
+    /// Caller contract: all sibling `BatchTxState` read guards must be
+    /// dropped (via [`BatchTxState::finish`]) before the first call to this
+    /// method; the scheduler enforces batch disjointness so `RowPointer`
+    /// validity across the gap holds.
+    pub fn commit_batch_tx(
+        &self,
+        finished: FinishedBatchTx,
+    ) -> Result<(TxOffset, TxData, TxMetrics, Option<ReducerName>)> {
+        let mut committed_state = self.committed_state.write_arc();
+
+        debug_assert!(
+            finished
+                .tx_state
+                .delete_tables
+                .iter()
+                .all(|(table_id, row_ptrs)| {
+                    committed_state
+                        .get_table(*table_id)
+                        .map(|table| {
+                            row_ptrs
+                                .iter()
+                                .all(|ptr| table.get_row_ref(&committed_state.blob_store, ptr).is_some())
+                        })
+                        .unwrap_or(true)
+                }),
+            "batch disjointness violated: a sibling commit invalidated this overlay's delete pointers"
+        );
+
+        let tx_offset = committed_state.next_tx_offset;
+        let tx_data = committed_state.merge(finished.tx_state, finished.read_sets, &finished.ctx);
+
+        let tx_metrics = TxMetrics::new(
+            &finished.ctx,
+            finished.timer,
+            finished.lock_wait_time,
+            finished.metrics,
+            true,
+            Some(&tx_data),
+            &committed_state,
+        );
+        let reducer = finished.ctx.into_reducer_name();
+
+        let tx_offset = if tx_offset == committed_state.next_tx_offset {
+            tx_offset.saturating_sub(1)
+        } else {
+            tx_offset
+        };
+
+        Ok((tx_offset, tx_data, tx_metrics, reducer))
     }
 }
 
