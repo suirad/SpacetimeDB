@@ -15,7 +15,6 @@ use crate::host::module_host::{
     ViewCommandResult, ViewOutcome,
 };
 use crate::host::scheduler::{CallScheduledFunctionResult, ScheduledFunctionParams};
-use crate::host::shadow_access::{shadow_enabled, ObservedNames, ShadowAccess};
 use crate::host::{
     ArgsTuple, ModuleHost, ProcedureCallError, ProcedureCallResult, ReducerCallError, ReducerCallResult, ReducerId,
     ReducerOutcome, Scheduler, UpdateDatabaseResult,
@@ -339,7 +338,6 @@ pub struct WasmModuleHostActor<T: WasmModule> {
     module: T::InstancePre,
     common: ModuleCommon,
     func_names: Arc<FuncNames>,
-    shadow: Option<Arc<ShadowAccess>>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -408,14 +406,12 @@ impl<T: WasmModule> WasmModuleHostActor<T> {
         // Validate and create a common module rom the raw definition.
         let common = build_common_module_from_raw(mcc, desc)?;
 
-        let shadow = build_shadow_access(&common, program_bytes);
 
         let func_names = Arc::new(func_names);
         let module = WasmModuleHostActor {
             module: uninit_instance,
             func_names,
             common,
-            shadow,
         };
         let initial_instance = module.make_from_instance(instance);
 

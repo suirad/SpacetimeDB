@@ -7231,14 +7231,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sdk-test-shadow-access"
-version = "0.1.0"
-dependencies = [
- "log",
- "spacetimedb",
-]
-
-[[package]]
 name = "sdk-test-view"
 version = "0.1.0"
 dependencies = [
@@ -7512,21 +7504,6 @@ checksum = "75872d278a8f37ef87fa0ddbda7802605cb18344497949862c0d4dcb291eba60"
 dependencies = [
  "digest",
  "keccak",
-]
-
-[[package]]
-name = "shadow-access-client"
-version = "2.5.0"
-dependencies = [
- "anyhow",
- "console_error_panic_hook",
- "env_logger 0.10.2",
- "futures",
- "spacetimedb-sdk",
- "test-counter",
- "tokio",
- "wasm-bindgen",
- "wasm-bindgen-futures",
 ]
 
 [[package]]
