@@ -87,7 +87,48 @@ pub fn recover(module: &Module, imports: &ImportTable, graph: &CallGraph) -> Pro
     for (fid, lf) in module.funcs.iter_local() {
         recover_in_func(fid, lf, &data, &reaches, &mut prov);
     }
+    keep_leaf_sites_only(&mut prov, graph);
     prov
+}
+
+/// Drop any recovered name on a function `F` whose forward call-closure reaches
+/// **another** function that also recovered a name. Rationale (soundness):
+///
+/// The genuine name of a table/index is always recovered at its *leaf accessor*
+/// — the monomorphized `T::table_id()`/`Idx::index_id()` closure that pushes the
+/// constant `(name_ptr, name_len)` and calls the resolver. A leaf accessor never
+/// directly calls another accessor (each resolves its own name independently),
+/// so it has no bound function in its forward closure and is always kept.
+///
+/// Non-leaf functions that merely *reach* a resolver (e.g. `OnceLock`/`Once`
+/// machinery wrapping the lazy id init, or `get_or_init`) can pick up a spurious
+/// `(ptr, len)` pair from unrelated locals (a closure-data pointer + a flag bit)
+/// that happens to read as a valid 1-byte UTF-8 string in an active data
+/// segment. Those false names are bound to the *caller* of the real accessor,
+/// never to the accessor itself, so they always sit "above" a genuine leaf in
+/// the call graph and are dropped here.
+///
+/// This cannot under-approximate: every table a reducer truly touches is reached
+/// through that table's leaf accessor (the only function that materializes the
+/// name), which is in the reducer's forward closure and keeps its binding. We
+/// only remove names attached to non-leaf wrappers, whose name is — by the leaf
+/// invariant — already (and correctly) recovered downstream.
+fn keep_leaf_sites_only(prov: &mut Provenance, graph: &CallGraph) {
+    let bound: HashSet<FunctionId> = prov.by_func.keys().copied().collect();
+    let mut drop: Vec<FunctionId> = Vec::new();
+    for &fid in &bound {
+        // Does any *other* bound function lie strictly downstream of `fid`?
+        let reaches_other_bound = graph
+            .forward_closure([fid])
+            .into_iter()
+            .any(|f| f != fid && bound.contains(&f));
+        if reaches_other_bound {
+            drop.push(fid);
+        }
+    }
+    for fid in drop {
+        prov.by_func.remove(&fid);
+    }
 }
 
 /// Per-function flags: can this function reach the table / index resolver via
@@ -158,10 +199,10 @@ fn recover_in_func(
                     }
                 }
                 Instr::Call(call) => {
-                    if let Some(kind) = reaches.kind_of(call.func) {
-                        if let Some(name) = find_name_pair(data, &last_consts) {
-                            bind(prov, fid, ResolvedName { name, kind });
-                        }
+                    if let Some(kind) = reaches.kind_of(call.func)
+                        && let Some(name) = find_name_pair(data, &last_consts)
+                    {
+                        bind(prov, fid, ResolvedName { name, kind });
                     }
                     last_consts.clear();
                     push_nested(instr, &mut seqs);
@@ -306,6 +347,64 @@ mod tests {
             }),
         );
         assert!(prov.ambiguous.is_empty());
+    }
+
+    /// A non-leaf wrapper that *reaches* the resolver only by calling the real
+    /// accessor must not pick up a spurious name from unrelated `i32.const`s.
+    /// This is the `OnceLock`/`Once::call` shape: lazy-id machinery wraps the
+    /// accessor closure, and its once-state constants (a closure-data pointer +
+    /// a flag) can coincidentally read as a valid 1-byte name in the data
+    /// segment. The leaf filter must drop the wrapper's binding while keeping
+    /// the accessor's, so attribution never sees a name outside the ModuleDef.
+    #[test]
+    fn non_leaf_wrapper_above_accessor_does_not_bind_spurious_name() {
+        // Address 64 holds the byte '$' (0x24); a `(64, 1)` const pair reads it
+        // as the 1-char name "$", exactly the false positive seen in the wild.
+        let wat = r#"
+            (module
+              (import "spacetime_10.0" "table_id_from_name"
+                (func $tres (param i32 i32 i32) (result i32)))
+              (memory 1)
+              (data (i32.const 16) "widget")
+              (data (i32.const 64) "$")
+              ;; real leaf accessor: const name then call the resolver.
+              (func $accessor (result i32)
+                i32.const 16
+                i32.const 6
+                i32.const 0
+                call $tres)
+              ;; once-like wrapper: reaches the resolver only via $accessor, but
+              ;; carries stray consts (a data pointer 64 + flag 1) that read as a
+              ;; valid 1-byte name.
+              (func $once_wrap (result i32)
+                i32.const 64
+                i32.const 1
+                drop
+                drop
+                call $accessor)
+              (export "acc" (func $accessor))
+              (export "wrap" (func $once_wrap))
+            )
+        "#;
+        let wasm = wat::parse_str(wat).unwrap();
+        let module = Module::from_buffer(&wasm).unwrap();
+        let imports = classify_imports(&module);
+        let graph = CallGraph::build(&module);
+        let prov = recover(&module, &imports, &graph);
+
+        let acc = func_id_by_name(&module, "acc");
+        let wrap = func_id_by_name(&module, "wrap");
+
+        assert_eq!(
+            prov.by_func.get(&acc),
+            Some(&ResolvedName { name: "widget".into(), kind: NameKind::Table }),
+            "leaf accessor keeps its genuine name",
+        );
+        assert_eq!(
+            prov.by_func.get(&wrap),
+            None,
+            "non-leaf wrapper above the accessor must not bind a spurious name",
+        );
     }
 
     #[test]

@@ -94,6 +94,14 @@ impl CommittedState {
         self.read_sets.is_empty()
     }
 
+    /// Returns true iff any table in `tables` has a live view read-set entry.
+    ///
+    /// A batch member writing such a table must not be admitted: it would trigger
+    /// view refresh inside the reducer tx, which the batch path never runs.
+    pub fn view_read_overlap(&self, mut tables: impl Iterator<Item = TableId>) -> bool {
+        tables.any(|tid| self.read_sets.contains_table(&tid))
+    }
+
     /// Returns the views that perform a full scan of this table
     pub(super) fn views_for_table_scan(&self, table_id: &TableId) -> impl Iterator<Item = &ViewCallInfo> + use<'_> {
         self.read_sets.views_for_table_scan(table_id)

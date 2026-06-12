@@ -27,7 +27,8 @@ use crate::subscription::row_list_builder_pool::{BsatnRowListBuilderPool, JsonRo
 use crate::subscription::tx::DeltaTx;
 use crate::subscription::websocket_building::{BuildableWebsocketFormat, RowListBuilderSource};
 use crate::subscription::{execute_plan, execute_plan_for_view};
-use crate::util::jobs::{AllocatedJobCore, SingleThreadedExecutor};
+use super::reducer_scheduler::{BatchingExecutor, ReducerGlue};
+use crate::util::jobs::AllocatedJobCore;
 use crate::worker_metrics::WORKER_METRICS;
 use anyhow::Context;
 use bytes::Bytes;
@@ -374,7 +375,7 @@ impl Drop for CallTimerGuard {
 
 type WasmtimeProcedureInstanceManager = ModuleInstanceManager<Arc<super::wasmtime::ProcedureModule>>;
 
-struct WasmtimeModuleState {
+pub(crate) struct WasmtimeModuleState {
     instance: Box<super::wasmtime::ModuleInstance>,
     module: Arc<super::wasmtime::Module>,
     metrics: InstanceManagerMetrics,
@@ -394,7 +395,11 @@ impl WasmtimeModuleState {
         }
     }
 
-    fn with_instance<R>(&mut self, f: impl FnOnce(&mut ModuleInstance) -> R) -> R {
+    pub(crate) fn actor(&self) -> &Arc<super::wasmtime::Module> {
+        &self.module
+    }
+
+    pub(crate) fn with_instance<R>(&mut self, f: impl FnOnce(&mut ModuleInstance) -> R) -> R {
         let res = f(self.instance.as_mut());
         if self.instance.needs_replacement() {
             self.metrics.track_instance_removed();
@@ -416,15 +421,11 @@ impl WasmtimeModuleState {
 /// to acquire.
 struct WasmtimeModuleHost {
     module: Arc<super::wasmtime::Module>,
-    executor: SingleThreadedExecutor<WasmtimeModuleState>,
+    executor: BatchingExecutor,
     procedure_instances: Arc<WasmtimeProcedureInstanceManager>,
 }
 
 impl WasmtimeModuleHost {
-    fn shadow(&self) -> Option<Arc<crate::host::shadow_access::ShadowAccess>> {
-        self.module.shadow()
-    }
-
     fn enqueue_with_main_instance<A>(
         &self,
         label: &str,
@@ -753,9 +754,6 @@ pub struct CallReducerParams {
     pub timer: Option<Instant>,
     pub reducer_id: ReducerId,
     pub args: ArgsTuple,
-    /// Shadow-mode mirror sequence, set only on the wasm enqueue lanes; all other
-    /// producers leave it `None` so they appear as conservative sim barriers.
-    pub shadow_seq: Option<u64>,
 }
 
 impl CallReducerParams {
@@ -776,7 +774,6 @@ impl CallReducerParams {
             timer: None,
             reducer_id,
             args,
-            shadow_seq: None,
         }
     }
 }
@@ -1712,7 +1709,7 @@ impl ModuleHost {
                 let metrics = InstanceManagerMetrics::new(module.host_type(), database_identity);
                 let main_state = WasmtimeModuleState::new(module.clone(), init_inst, metrics.clone());
 
-                let executor = core.spawn_executor(main_state, thread_name);
+                let executor = BatchingExecutor::spawn(core, main_state, thread_name);
                 let procedure_instances = Arc::new(ModuleInstanceManager::new_bounded_with_metrics(
                     procedure_module,
                     None,
@@ -2229,7 +2226,6 @@ impl ModuleHost {
             timer,
             reducer_id,
             args,
-            shadow_seq: None,
         })
     }
 
@@ -2275,14 +2271,20 @@ impl ModuleHost {
     async fn call_reducer_with_params(
         &self,
         reducer_name: &ReducerName,
-        mut params: CallReducerParams,
+        params: CallReducerParams,
     ) -> Result<ReducerCallResult, ReducerCallError> {
-        // Register on the wasm lane at enqueue time (the macro's wasm closure runs
-        // later on the executor thread and can't reach the shadow handle).
-        if let ModuleHostInner::Wasm(wasm_host) = &*self.inner {
-            if let Some(shadow) = wasm_host.shadow() {
-                params.shadow_seq = Some(shadow.register_enqueue(params.reducer_id));
-            }
+        // Wasm reducers go through the typed batching lane (admission + fork); every
+        // other producer keeps the closure lane. V8 keeps `call`.
+        if let ModuleHostInner::Wasm(host) = &*self.inner {
+            self.guard_closed()?;
+            let timer_guard = self.start_call_timer(reducer_name);
+            let glue = ReducerGlue {
+                label: "websocket reducer operation".to_owned(),
+                on_panic: self.on_panic.clone(),
+                timer_guard: Some(Box::new(move || drop(timer_guard))),
+            };
+            let executor = host.executor.clone();
+            return Ok(executor.call_reducer(params, glue).await);
         }
         call_instance!(self, reducer_name, params, |p, inst| inst.call_reducer(p), |p, inst| {
             inst.call_reducer(p).await
@@ -2380,25 +2382,18 @@ impl ModuleHost {
             reducer_name,
             args,
             async |call| {
-                let reducer_label = call.name;
                 self.enqueue_main_operation(
                     "websocket reducer operation",
                     reducer_name,
                     call.params,
                     |params, inst, on_panic| async move { inst.enqueue_reducer(params, on_panic).await },
-                    move |mut params, wasm_host, on_panic, timer_guard| {
-                        if let Some(shadow) = wasm_host.shadow() {
-                            params.shadow_seq = Some(shadow.register_enqueue(params.reducer_id));
-                        }
-                        wasm_host.enqueue_with_main_instance(
-                            &reducer_label,
+                    move |params, wasm_host, on_panic, timer_guard| {
+                        let glue = ReducerGlue {
+                            label: "websocket reducer operation".to_owned(),
                             on_panic,
-                            timer_guard,
-                            params,
-                            move |params, inst| {
-                                let _ = inst.call_reducer(params);
-                            },
-                        );
+                            timer_guard: Some(Box::new(move || drop(timer_guard))),
+                        };
+                        wasm_host.executor.enqueue_call_reducer(params, glue);
                         Ok(())
                     },
                 )
@@ -3477,6 +3472,18 @@ impl ModuleHost {
             }
             Ok(())
         })
+    }
+
+    /// Return a point-in-time snapshot of batching scheduler statistics.
+    ///
+    /// Returns `None` for V8 hosts (which don't use the batching executor) or
+    /// if the loop thread has already exited.
+    #[doc(hidden)]
+    pub async fn batch_stats(&self) -> Option<crate::host::reducer_scheduler::BatchStatsSnapshot> {
+        match &*self.inner {
+            ModuleHostInner::Wasm(host) => host.executor.stats_snapshot().await,
+            ModuleHostInner::Js(_) => None,
+        }
     }
 
     pub fn downgrade(&self) -> WeakModuleHost {

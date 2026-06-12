@@ -885,7 +885,7 @@ enum JsProcedureWorkerRequest {
     },
 }
 
-static_assert_size!(CallReducerParams, 208);
+static_assert_size!(CallReducerParams, 192);
 
 fn send_worker_reply<T>(ctx: &str, reply_tx: JsReplyTx<T>, value: T) {
     if reply_tx.send(Ok(value)).is_err() {
@@ -1677,7 +1677,7 @@ where
                 // Setup the instance common.
                 let args = Global::new(scope, ArrayBuffer::new(scope, REDUCER_ARGS_BUFFER_SIZE));
                 let info = &module_common.info();
-                let mut instance_common = InstanceCommon::new(&module_common, None);
+                let mut instance_common = InstanceCommon::new(&module_common);
                 let replica_ctx: &Arc<ReplicaContext> = module_common.replica_ctx();
                 let mut heap_metrics = V8HeapMetrics::new(&info.database_identity, worker_kind);
 

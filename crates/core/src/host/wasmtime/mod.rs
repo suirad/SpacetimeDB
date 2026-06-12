@@ -139,7 +139,7 @@ pub type ModuleInstance = WasmModuleInstance<WasmtimeInstance>;
 // suffix short enough to survive after the `wasm-` prefix.
 const THREAD_NAME_DATABASE_ID_SUFFIX_LEN: usize = 10;
 
-fn wasm_worker_thread_name(database_identity: &spacetimedb_lib::Identity) -> String {
+pub(crate) fn wasm_worker_thread_name(database_identity: &spacetimedb_lib::Identity) -> String {
     let hex = database_identity.to_hex();
     // We use the tail of the identity to avoid the common structured prefix.
     let suffix = &hex.as_str()[hex.as_str().len() - THREAD_NAME_DATABASE_ID_SUFFIX_LEN..];

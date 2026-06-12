@@ -1,6 +1,8 @@
 pub mod abi;
 pub mod instrumentation;
 pub mod module_host_actor;
+pub(crate) mod reducer_access;
+pub(crate) mod reducer_worker;
 
 use std::fmt;
 use std::num::NonZeroU16;

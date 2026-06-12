@@ -6245,6 +6245,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "reducer-batching-fixture"
+version = "0.0.0"
+dependencies = [
+ "log",
+ "spacetimedb",
+]
+
+[[package]]
 name = "ref-cast"
 version = "1.0.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"

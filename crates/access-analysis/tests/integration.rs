@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_macros)]
 //! Integration tests: analyze real compiled modules and assert the per-reducer
 //! access sets, with zero under-approximation as the bar.
 
@@ -142,7 +143,7 @@ fn perf_test_release_wasm_opt() {
     };
 
     let Some(wasm_opt_bin) = wasm_opt_bin else {
-        eprintln!("SKIP perf_test_release_wasm_opt: wasm-opt not found on PATH");
+        println!("SKIP perf_test_release_wasm_opt: wasm-opt not found on PATH");
         return;
     };
 
@@ -175,7 +176,7 @@ fn perf_test_release_wasm_opt() {
 
     let opt_bytes = std::fs::read(&output_path).expect("failed to read optimized wasm");
 
-    eprintln!(
+    println!(
         "perf_test_release_wasm_opt: release bytes = {}, opt bytes = {} (wasm-opt ran)",
         release_bytes.len(),
         opt_bytes.len()
@@ -192,7 +193,7 @@ fn perf_test_release_wasm_opt() {
     // Dump per-reducer sets to help diagnose wasm-opt-induced over-approximation
     // if this test ever needs updating.
     for (name, set) in &sets {
-        eprintln!(
+        println!(
             "  [{name}]: wildcard={}, reads={:?}, writes={:?}",
             set.wildcard,
             names(&set.reads),

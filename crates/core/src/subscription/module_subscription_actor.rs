@@ -32,7 +32,7 @@ use spacetimedb_data_structures::map::{HashCollectionExt as _, HashMap, HashSet}
 use spacetimedb_datastore::db_metrics::DB_METRICS;
 use spacetimedb_datastore::execution_context::{Workload, WorkloadType};
 use spacetimedb_datastore::locking_tx_datastore::datastore::TxMetrics;
-use spacetimedb_datastore::locking_tx_datastore::{MutTxId, TxId};
+use spacetimedb_datastore::locking_tx_datastore::{batch_tx::FinishedBatchTx, MutTxId, TxId};
 use spacetimedb_datastore::traits::{IsolationLevel, TxData};
 use spacetimedb_durability::TxOffset;
 use spacetimedb_execution::ExecutionParams;
@@ -200,6 +200,18 @@ pub(crate) fn commit_and_broadcast_event(
     tx: MutTxId,
 ) -> CommitAndBroadcastEventSuccess {
     match subs.commit_and_broadcast_event(client, event, tx).unwrap() {
+        Ok(res) => res,
+        Err(WriteConflict) => todo!("Write skew, you need to implement retries my man, T-dawg."),
+    }
+}
+
+pub(crate) fn commit_and_broadcast_batch_event(
+    subs: &ModuleSubscriptions,
+    client: Option<Arc<ClientConnectionSender>>,
+    event: ModuleEvent,
+    finished: Option<FinishedBatchTx>,
+) -> CommitAndBroadcastEventSuccess {
+    match subs.commit_and_broadcast_batch_event(client, event, finished).unwrap() {
         Ok(res) => res,
         Err(WriteConflict) => todo!("Write skew, you need to implement retries my man, T-dawg."),
     }
@@ -1800,14 +1812,94 @@ impl ModuleSubscriptions {
             }
         };
         let event = Arc::new(event);
+        self.broadcast_event_inner(subscriptions, subscription_metrics, read_tx, tx_data, tx_metrics_mut, event, caller)
+    }
 
-        // When we're done with this method, release the tx and report metrics.
+    /// Mirrors [`Self::commit_and_broadcast_event`], using `commit_batch_tx_downgrade` and
+    /// omitting rollback on failure (the overlay was already rolled back; `finished` is `None`).
+    ///
+    /// The subscriptions read lock is acquired BEFORE committing — load-bearing for duplicate-protection.
+    pub(crate) fn commit_and_broadcast_batch_event(
+        &self,
+        caller: Option<Arc<ClientConnectionSender>>,
+        mut event: ModuleEvent,
+        finished: Option<FinishedBatchTx>,
+    ) -> Result<CommitAndBroadcastEventResult, DBError> {
+        let subscription_metrics = &self.metrics.update;
+
+        let subscriptions = {
+            let _wait_guard = subscription_metrics.lock_waiters.inc_scope();
+            let _wait_timer = subscription_metrics.lock_wait_time.start_timer();
+            self.subscriptions.read()
+        };
+
+        let stdb = &self.relational_db;
+        let (read_tx, tx_data, tx_metrics_mut) = match &mut event.status {
+            EventStatus::Committed(db_update) => {
+                let finished = finished.expect("FinishedBatchTx must be Some for a Committed batch event");
+                let (tx_data, tx_metrics, read_tx) = stdb.commit_batch_tx_downgrade(finished, Workload::Update);
+                *db_update = DatabaseUpdate::from_writes(&tx_data);
+                (read_tx, tx_data, tx_metrics)
+            }
+            EventStatus::FailedUser(_) | EventStatus::FailedInternal(_) | EventStatus::OutOfEnergy => {
+                let event = Arc::new(event);
+                // The overlay was already rolled back by the body executor; there is no tx to roll back here.
+                // We do need a tx offset for the client message; obtain one from a no-op read tx release.
+                let read_tx = stdb.begin_tx(Workload::Update);
+                let (tx_offset, tx_metrics, reducer) = stdb.release_tx(read_tx);
+                stdb.report_tx_metrics(reducer, None, Some(tx_metrics), None);
+                if let Some(client) = caller {
+                    match client.config.version {
+                        WsVersion::V1 => {
+                            let message = TransactionUpdateMessage {
+                                event: Some(event.clone()),
+                                database_update: SubscriptionUpdateMessage::default_for_protocol(
+                                    client.config.protocol,
+                                    None,
+                                ),
+                            };
+                            let _ = self.broadcast_queue.send_client_message_v1(
+                                client,
+                                Some(from_tx_offset(tx_offset)),
+                                message,
+                            );
+                        }
+                        WsVersion::V2 | WsVersion::V3 => {
+                            if let Some(request_id) = event.request_id {
+                                self.send_reducer_failure_result_v2(client, &event, request_id);
+                            }
+                        }
+                    }
+                } else {
+                    log::trace!("Reducer failed but there is no client to send the failure to!")
+                }
+                return Ok(Ok(CommitAndBroadcastEventSuccess {
+                    tx_offset: from_tx_offset(tx_offset),
+                    event,
+                    metrics: ExecutionMetrics::default(),
+                }));
+            }
+        };
+        let event = Arc::new(event);
+        self.broadcast_event_inner(subscriptions, subscription_metrics, read_tx, tx_data, tx_metrics_mut, event, caller)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn broadcast_event_inner(
+        &self,
+        subscriptions: parking_lot::RwLockReadGuard<'_, SubscriptionManager>,
+        subscription_metrics: &SubscriptionMetrics,
+        read_tx: TxId,
+        tx_data: Arc<TxData>,
+        tx_metrics_mut: TxMetrics,
+        event: Arc<ModuleEvent>,
+        caller: Option<Arc<ClientConnectionSender>>,
+    ) -> Result<CommitAndBroadcastEventResult, DBError> {
         let (extra_tx_offset_sender, extra_tx_offset) = oneshot::channel();
         let (mut read_tx, tx_offset) = self.guard_tx(
             read_tx,
             GuardTxOptions::full(extra_tx_offset_sender, Some(tx_data.clone()), tx_metrics_mut),
         );
-        // Create the delta transaction we'll use to eval updates against.
         let delta_read_tx = DeltaTx::new(&read_tx, tx_data.as_ref(), subscriptions.index_ids_for_subscriptions());
         let (update_metrics, failed_v2_subscriptions) = subscriptions.eval_updates_sequential(
             (&delta_read_tx, tx_offset),
@@ -1817,8 +1909,6 @@ impl ModuleSubscriptions {
             caller,
         );
         drop(subscriptions);
-        // For subscriptions that had an error, we have send the client an error message,
-        // but we also need to remove the subscription so that we don't keep trying to send updates.
         if !failed_v2_subscriptions.is_empty() {
             let mut subscriptions = {
                 let _wait_guard = subscription_metrics.lock_waiters.inc_scope();
@@ -4318,6 +4408,78 @@ mod tests {
 
         assert_tx_update_for_table(rx_for_a.recv(), table_id, &schema, [product![1_u8]], []).await;
         assert_tx_update_for_table(rx_for_b.recv(), table_id, &schema, [product![2_u8]], []).await;
+
+        Ok(())
+    }
+
+    /// No subscribers: tests the commit path and `DatabaseUpdate` shape only.
+    /// Broadcast correctness over subscribers is covered by existing Mut-path tests
+    /// (the shared `broadcast_event_inner` helper is exercised by both paths).
+    #[tokio::test]
+    async fn batch_commit_and_broadcast_matches_mut() -> anyhow::Result<()> {
+        use crate::db::relational_db::tests_utils::begin_mut_tx;
+        use spacetimedb_datastore::execution_context::Workload;
+        use spacetimedb_lib::AlgebraicType;
+        use spacetimedb_sats::bsatn;
+
+        // Use two independent in-memory databases so there is no committed-row deduplication
+        // interference between the Mut and Batch paths.
+        let db_m = relational_db()?;
+        let table_id_m = db_m.create_table_for_test("t", &[("v", AlgebraicType::U8)], &[])?;
+
+        let db_b = relational_db()?;
+        let table_id_b = db_b.create_table_for_test("t", &[("v", AlgebraicType::U8)], &[])?;
+
+        // --- Mut path ---
+        let subs_m = ModuleSubscriptions::for_test_enclosing_runtime(db_m.clone());
+        let mut mut_tx = begin_mut_tx(&db_m);
+        db_m.insert(&mut mut_tx, table_id_m, &bsatn::to_vec(&product![42_u8])?)?;
+        let event_m = module_event();
+        let result_m = subs_m.commit_and_broadcast_event(None, event_m, mut_tx);
+        let success_m = match result_m.unwrap() {
+            Ok(s) => s,
+            Err(_) => panic!("unexpected WriteConflict on mut path"),
+        };
+        let db_update_m = match &success_m.event.status {
+            EventStatus::Committed(upd) => upd.clone(),
+            _ => panic!("expected Committed"),
+        };
+
+        // --- Batch path ---
+        let subs_b = ModuleSubscriptions::for_test_enclosing_runtime(db_b.clone());
+        let mut btx = db_b.begin_batch_tx(Workload::Update);
+        let (_, _, _) = btx.insert::<true>(table_id_b, &bsatn::to_vec(&product![42_u8])?)?;
+        let finished = btx.finish();
+
+        let event_b = module_event();
+        let result_b = subs_b.commit_and_broadcast_batch_event(None, event_b, Some(finished));
+        let success_b = match result_b.unwrap() {
+            Ok(s) => s,
+            Err(_) => panic!("unexpected WriteConflict on batch path"),
+        };
+        let db_update_b = match &success_b.event.status {
+            EventStatus::Committed(upd) => upd.clone(),
+            _ => panic!("expected Committed"),
+        };
+
+        // Both paths must report exactly one insert with the same row value (table ids differ
+        // across independent datastores, so compare by value only).
+        let inserts_m: Vec<_> = db_update_m
+            .tables
+            .iter()
+            .filter(|t| t.table_id == table_id_m)
+            .flat_map(|t| t.inserts.iter().cloned())
+            .collect();
+        let inserts_b: Vec<_> = db_update_b
+            .tables
+            .iter()
+            .filter(|t| t.table_id == table_id_b)
+            .flat_map(|t| t.inserts.iter().cloned())
+            .collect();
+
+        assert_eq!(inserts_m.len(), 1, "mut path: expected 1 insert");
+        assert_eq!(inserts_b.len(), 1, "batch path: expected 1 insert");
+        assert_eq!(inserts_m, inserts_b, "insert row values must match between mut and batch paths");
 
         Ok(())
     }

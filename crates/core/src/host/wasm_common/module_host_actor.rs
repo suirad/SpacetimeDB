@@ -1,4 +1,5 @@
 use super::instrumentation::CallTimes;
+use super::reducer_access::ReducerAccessInfo;
 use super::*;
 use crate::client::ClientActorId;
 use crate::database_logger;
@@ -37,6 +38,7 @@ use spacetimedb_auth::identity::ConnectionAuthCtx;
 use spacetimedb_datastore::db_metrics::DB_METRICS;
 use spacetimedb_datastore::error::{DatastoreError, ViewError};
 use spacetimedb_datastore::execution_context::{self, ReducerContext, Workload};
+use spacetimedb_datastore::locking_tx_datastore::batch_tx::{BatchTxState, FinishedBatchTx};
 use spacetimedb_datastore::locking_tx_datastore::{FuncCallType, MutTxId, ViewCallInfo};
 use spacetimedb_datastore::traits::{IsolationLevel, Program};
 use spacetimedb_execution::ExecutionParams;
@@ -338,6 +340,8 @@ pub struct WasmModuleHostActor<T: WasmModule> {
     module: T::InstancePre,
     common: ModuleCommon,
     func_names: Arc<FuncNames>,
+    /// Shared via `Arc` so the scheduler can hold a cheap reference without keeping the full actor alive.
+    reducer_access: Arc<ReducerAccessInfo>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -403,15 +407,17 @@ impl<T: WasmModule> WasmModuleHostActor<T> {
 
         let desc = instance.extract_descriptions()?;
 
-        // Validate and create a common module rom the raw definition.
+        // Validate and create a common module from the raw definition.
         let common = build_common_module_from_raw(mcc, desc)?;
 
+        let reducer_access = Arc::new(ReducerAccessInfo::new(program_bytes, &common.info().module_def));
 
         let func_names = Arc::new(func_names);
         let module = WasmModuleHostActor {
             module: uninit_instance,
             func_names,
             common,
+            reducer_access,
         };
         let initial_instance = module.make_from_instance(instance);
 
@@ -424,18 +430,14 @@ impl<T: WasmModule> WasmModuleHostActor<T> {
             module,
             common: self.common.clone(),
             func_names: self.func_names.clone(),
-            shadow: self.shadow.clone(),
+            reducer_access: self.reducer_access.clone(),
         })
-    }
-
-    pub fn shadow(&self) -> Option<Arc<ShadowAccess>> {
-        self.shadow.clone()
     }
 }
 
 impl<T: WasmModule> WasmModuleHostActor<T> {
     fn make_from_instance(&self, mut instance: T::Instance) -> WasmModuleInstance<T::Instance> {
-        let common = InstanceCommon::new(&self.common, self.shadow.clone());
+        let common = InstanceCommon::new(&self.common);
         instance.set_module_def(common.info().module_def.clone());
         WasmModuleInstance {
             instance,
@@ -458,6 +460,13 @@ impl<T: WasmModule> WasmModuleHostActor<T> {
         self.common.info()
     }
 
+    /// Returns the static access-analysis result for this module.
+    ///
+    /// Callers hold this cheaply via `Arc` without keeping the full actor alive.
+    pub(crate) fn reducer_access(&self) -> Arc<ReducerAccessInfo> {
+        self.reducer_access.clone()
+    }
+
     pub fn create_instance(&self) -> WasmModuleInstance<T::Instance> {
         let common = &self.common;
         let env = InstanceEnv::new(common.replica_ctx().clone(), common.scheduler().clone());
@@ -469,28 +478,6 @@ impl<T: WasmModule> WasmModuleHostActor<T> {
             .expect("failed to initialize instance");
         let _ = instance.extract_descriptions();
         self.make_from_instance(instance)
-    }
-}
-
-/// Build the shadow-access harness for a freshly published module, if enabled.
-///
-/// Analysis failure is sound to ignore: no analysis just means no shadow data,
-/// so it never blocks publish.
-fn build_shadow_access(common: &ModuleCommon, program_bytes: &[u8]) -> Option<Arc<ShadowAccess>> {
-    if !shadow_enabled() {
-        return None;
-    }
-    let info = common.info();
-    match spacetimedb_access_analysis::analyze(program_bytes, &info.module_def) {
-        Ok(sets) => {
-            let reducer_names = info.module_def.reducers().map(|r| r.name.to_string()).collect();
-            let database_identity = info.database_identity.to_hex().to_string();
-            Some(Arc::new(ShadowAccess::new(sets, reducer_names, database_identity)))
-        }
-        Err(err) => {
-            log::warn!("shadow access analysis failed; shadow disabled for this module: {err}");
-            None
-        }
     }
 }
 
@@ -634,17 +621,47 @@ impl<T: WasmInstance> WasmModuleInstance<T> {
         self.trapped = trapped;
         res
     }
+
+    /// Run a batch body and update `self.trapped` from the outcome.
+    pub(crate) fn call_reducer_body_batch(
+        &mut self,
+        tx: BatchTxState,
+        params: CallReducerParams,
+    ) -> BatchBodyOutcome {
+        let outcome = self.common.call_reducer_body_batch(tx, params, &mut self.instance);
+        self.trapped = outcome.trapped;
+        outcome
+    }
+}
+
+/// `Committed` carries a placeholder `DatabaseUpdate`; the drain replaces it on commit.
+struct ReducerBodyOutcome {
+    status: EventStatus,
+    reducer_return_value: Option<Bytes>,
+    trapped: bool,
+    execution_budget_used: FunctionBudget,
+    total_duration: Duration,
+}
+
+pub(crate) struct BatchBodyOutcome {
+    /// `None` means the body failed; the overlay was already rolled back.
+    pub finished: Option<FinishedBatchTx>,
+    /// Status set; `Committed(DatabaseUpdate::default())` is a placeholder pre-commit,
+    /// exactly like the Mut path's pre-commit convention.
+    pub event: ModuleEvent,
+    pub execution_budget_used: FunctionBudget,
+    pub host_execution_duration: Duration,
+    pub trapped: bool,
 }
 
 pub struct InstanceCommon {
     info: Arc<ModuleInfo>,
     energy_monitor: Arc<dyn EnergyMonitor>,
     vm_metrics: AllVmMetrics,
-    shadow: Option<Arc<ShadowAccess>>,
 }
 
 impl InstanceCommon {
-    pub(crate) fn new(module: &ModuleCommon, shadow: Option<Arc<ShadowAccess>>) -> Self {
+    pub(crate) fn new(module: &ModuleCommon) -> Self {
         let info = module.info();
         let vm_metrics = AllVmMetrics::new(&info);
 
@@ -652,7 +669,6 @@ impl InstanceCommon {
             info: module.info(),
             vm_metrics,
             energy_monitor: module.energy_monitor(),
-            shadow,
         }
     }
 
@@ -986,7 +1002,6 @@ impl InstanceCommon {
             reducer_id,
             args,
             timer,
-            shadow_seq,
         } = params;
         let caller_connection_id_opt = (caller_connection_id != ConnectionId::ZERO).then_some(caller_connection_id);
 
@@ -1010,10 +1025,7 @@ impl InstanceCommon {
         };
 
         let workload = Workload::Reducer(ReducerContext::from(op.clone()));
-        let mut tx = tx.unwrap_or_else(|| stdb.begin_mut_tx(IsolationLevel::Serializable, workload));
-        if self.shadow.is_some() {
-            tx.enable_access_capture();
-        }
+        let tx = tx.unwrap_or_else(|| stdb.begin_mut_tx(IsolationLevel::Serializable, workload));
         let mut tx_slot = inst.tx_slot();
 
         let vm_metrics = self.vm_metrics.get_for_reducer_id(reducer_id);
@@ -1023,57 +1035,19 @@ impl InstanceCommon {
             self.call_function(caller_identity, reducer_name, |budget| inst.call_reducer(op, budget))
         });
 
-        // Report execution metrics on each reducer call.
-        vm_metrics.report(&result.stats);
+        let ReducerBodyOutcome {
+            status,
+            reducer_return_value,
+            trapped,
+            execution_budget_used,
+            total_duration,
+        } = self.map_reducer_body_result(result, reducer_name, timestamp, inst, &vm_metrics);
 
-        // Shadow diff: resolve observed table ids to names and feed the harness
-        // before views run or `tx` is consumed, so view/lifecycle work can't
-        // pollute the observed set (it was already taken here).
-        if let Some(shadow) = &self.shadow {
-            let observed = tx.take_observed().map(|obs| {
-                let resolve = |id: TableId| {
-                    tx.table_name_from_id(id)
-                        .ok()
-                        .flatten()
-                        .unwrap_or_else(|| format!("table#{}", id.0).into_boxed_str())
-                };
-                ObservedNames {
-                    reads: obs.reads.iter().map(|&id| resolve(id)).collect(),
-                    writes: obs.writes.iter().map(|&id| resolve(id)).collect(),
-                }
-            });
-            shadow.on_executed(shadow_seq, reducer_id, result.stats.total_duration(), observed);
-        }
-
-        // An outer error occurred.
-        // This signifies a logic error in the module rather than a properly
-        // handled bad argument from the caller of a reducer.
-        // For WASM, this will be interpreted as a trap
-        // and that the instance must be discarded.
-        // However, that does not necessarily apply to e.g., V8.
-        let trapped = matches!(result.call_result, Err(ExecutionError::Trap(_)));
-
-        let (status, mut reducer_return_value) = match result.call_result {
-            Err(ExecutionError::Recoverable(err) | ExecutionError::Trap(err)) => {
-                inst.log_traceback("reducer", reducer_name, &err);
-
-                (self.handle_outer_error(&result.stats.energy, reducer_name), None)
-            }
-            Err(ExecutionError::User(err)) => {
-                log_reducer_error(
-                    inst.replica_ctx(),
-                    timestamp,
-                    reducer_name,
-                    &err,
-                    &self.info.module_hash,
-                );
-                (EventStatus::FailedUser(err.into()), None)
-            }
-            // We haven't actually committed yet - `commit_and_broadcast_event` will commit
-            // for us and replace this with the actual database update.
-            Ok(return_value) => {
-                // If this is an OnDisconnect lifecycle event, remove the client from st_clients.
-                // We handle OnConnect events before running the reducer.
+        // If this is an OnDisconnect lifecycle event, remove the client from st_clients.
+        // We handle OnConnect events before running the reducer.
+        // This is Mut-only: batch members are non-lifecycle by admission.
+        let (status, mut reducer_return_value) = match status {
+            EventStatus::Committed(_) => {
                 let res = match reducer_def.lifecycle {
                     Some(Lifecycle::OnDisconnect) => {
                         tx.delete_st_client(caller_identity, caller_connection_id, info.database_identity)
@@ -1081,7 +1055,7 @@ impl InstanceCommon {
                     _ => Ok(()),
                 };
                 match res {
-                    Ok(()) => (EventStatus::Committed(DatabaseUpdate::default()), return_value),
+                    Ok(()) => (status, reducer_return_value),
                     Err(err) => {
                         let err = err.to_string();
                         log_reducer_error(
@@ -1095,6 +1069,7 @@ impl InstanceCommon {
                     }
                 }
             }
+            status => (status, reducer_return_value),
         };
 
         // Only re-evaluate and update views if the reducer's execution was successful
@@ -1117,9 +1092,6 @@ impl InstanceCommon {
         if !matches!(status, EventStatus::Committed(_)) {
             reducer_return_value = None;
         }
-
-        let execution_budget_used = result.stats.execution_budget_used();
-        let total_duration = result.stats.total_duration();
 
         let event = ModuleEvent {
             timestamp,
@@ -1146,6 +1118,158 @@ impl InstanceCommon {
         };
 
         (res, trapped)
+    }
+
+    /// Deliberately excludes the OnDisconnect `delete_st_client` step and view re-evaluation:
+    /// both are exclusive to the Mut lane (batch members are non-lifecycle and view-disjoint by admission).
+    fn map_reducer_body_result<I: WasmInstance>(
+        &mut self,
+        result: ReducerExecuteResult,
+        reducer_name: &str,
+        timestamp: Timestamp,
+        inst: &mut I,
+        vm_metrics: &VmMetrics,
+    ) -> ReducerBodyOutcome {
+        // Report execution metrics on each reducer call.
+        vm_metrics.report(&result.stats);
+
+        let execution_budget_used = result.stats.execution_budget_used();
+        let total_duration = result.stats.total_duration();
+
+        // An outer error occurred.
+        // This signifies a logic error in the module rather than a properly
+        // handled bad argument from the caller of a reducer.
+        // For WASM, this will be interpreted as a trap
+        // and that the instance must be discarded.
+        // However, that does not necessarily apply to e.g., V8.
+        let trapped = matches!(result.call_result, Err(ExecutionError::Trap(_)));
+
+        let (status, reducer_return_value) = match result.call_result {
+            Err(ExecutionError::Recoverable(err) | ExecutionError::Trap(err)) => {
+                inst.log_traceback("reducer", reducer_name, &err);
+
+                (self.handle_outer_error(&result.stats.energy, reducer_name), None)
+            }
+            Err(ExecutionError::User(err)) => {
+                log_reducer_error(
+                    inst.replica_ctx(),
+                    timestamp,
+                    reducer_name,
+                    &err,
+                    &self.info.module_hash,
+                );
+                (EventStatus::FailedUser(err.into()), None)
+            }
+            // We haven't actually committed yet - `commit_and_broadcast_event` will commit
+            // for us and replace this with the actual database update.
+            Ok(return_value) => (EventStatus::Committed(DatabaseUpdate::default()), return_value),
+        };
+
+        ReducerBodyOutcome {
+            status,
+            reducer_return_value,
+            trapped,
+            execution_budget_used,
+            total_duration,
+        }
+    }
+
+    /// Neither begins nor commits the tx: the caller begins it, and commit is deferred to the drain.
+    /// No lifecycle arm, no view phase (provably empty by admission; the commit-path debug_assert
+    /// enforces view-disjointness). [`BatchTxState`] holds only a read guard, so it is safe on a
+    /// worker thread and never deadlocks against sibling overlays.
+    pub(crate) fn call_reducer_body_batch<I: WasmInstance>(
+        &mut self,
+        tx: BatchTxState,
+        params: CallReducerParams,
+        inst: &mut I,
+    ) -> BatchBodyOutcome {
+        let CallReducerParams {
+            timestamp,
+            caller_identity,
+            caller_connection_id,
+            client: _,
+            request_id,
+            timer,
+            reducer_id,
+            args,
+        } = params;
+        let caller_connection_id_opt = (caller_connection_id != ConnectionId::ZERO).then_some(caller_connection_id);
+
+        let info = self.info.clone();
+        let reducer_def = info.module_def.reducer_by_id(reducer_id);
+        let reducer_name = &reducer_def.name;
+
+        // Admission excludes lifecycle reducers; the OnDisconnect arm is Mut-only.
+        debug_assert!(
+            reducer_def.lifecycle.is_none(),
+            "batch members must be non-lifecycle reducers"
+        );
+
+        let _outer_span = start_call_function_span(reducer_name, &caller_identity, caller_connection_id_opt);
+
+        let op = ReducerOp {
+            id: reducer_id,
+            name: reducer_name,
+            caller_identity: &caller_identity,
+            caller_connection_id: &caller_connection_id,
+            timestamp,
+            args: &args,
+        };
+
+        let mut tx_slot = inst.tx_slot();
+
+        let vm_metrics = self.vm_metrics.get_for_reducer_id(reducer_id);
+        let _guard = vm_metrics.timer_guard_for_reducer_plus_query(tx.timer);
+
+        let (tx, result) = tx_slot.set_batch(tx, || {
+            self.call_function(caller_identity, reducer_name, |budget| inst.call_reducer(op, budget))
+        });
+
+        let ReducerBodyOutcome {
+            status,
+            reducer_return_value,
+            trapped,
+            execution_budget_used,
+            total_duration,
+        } = self.map_reducer_body_result(result, reducer_name, timestamp, inst, &vm_metrics);
+
+        // On success keep the overlay for the deferred commit; on failure/trap roll
+        // it back here and report metrics as the Mut error path does on rollback.
+        let finished = if matches!(status, EventStatus::Committed(_)) {
+            Some(tx.finish())
+        } else {
+            let (tx_metrics, reducer) = tx.rollback();
+            self.info.relational_db().report_mut_tx_metrics(reducer, tx_metrics, None);
+            None
+        };
+
+        // Pre-commit `ModuleEvent`, mirroring the Mut path: the committed
+        // `DatabaseUpdate` is a placeholder replaced by the drain's commit.
+        let event = ModuleEvent {
+            timestamp,
+            caller_identity,
+            caller_connection_id: caller_connection_id_opt,
+            function_call: ModuleFunctionCall {
+                reducer: Some(reducer_name.clone()),
+                reducer_id,
+                args,
+            },
+            status,
+            reducer_return_value,
+            execution_budget_used,
+            host_execution_duration: total_duration,
+            request_id,
+            timer,
+        };
+
+        BatchBodyOutcome {
+            finished,
+            event,
+            execution_budget_used,
+            host_execution_duration: total_duration,
+            trapped,
+        }
     }
 
     fn handle_outer_error(&mut self, energy: &EnergyStats, reducer_name: &str) -> EventStatus {

@@ -15,6 +15,7 @@ mod host_controller;
 mod module_common;
 #[allow(clippy::too_many_arguments)]
 pub mod module_host;
+mod reducer_scheduler;
 pub mod scheduler;
 pub mod wasmtime;
 
@@ -29,6 +30,7 @@ pub use host_controller::{
     HostRuntimeConfig, MigratePlanResult, ProcedureCallResult, ProgramStorage, ReducerCallResult, ReducerOutcome,
 };
 pub use module_host::{ModuleHost, NoSuchModule, ProcedureCallError, ReducerCallError, UpdateDatabaseResult};
+pub use reducer_scheduler::{BatchStatsSnapshot, PoolStateTag};
 pub use scheduler::Scheduler;
 
 /// Encoded arguments to a database function.

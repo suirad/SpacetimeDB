@@ -17,7 +17,9 @@ use spacetimedb_client_api_messages::energy::FunctionBudget;
 use spacetimedb_datastore::db_metrics::DB_METRICS;
 use spacetimedb_datastore::execution_context::Workload;
 use spacetimedb_datastore::locking_tx_datastore::state_view::StateView;
-use spacetimedb_datastore::locking_tx_datastore::{FuncCallType, IndexScanPointOrRange, MutTxId, ReducerTxVariant};
+use spacetimedb_datastore::locking_tx_datastore::{
+    batch_tx::BatchTxState, FuncCallType, IndexScanPointOrRange, MutTxId, ReducerTxVariant,
+};
 use spacetimedb_datastore::ReducerTx;
 use spacetimedb_datastore::traits::IsolationLevel;
 use spacetimedb_lib::{http as st_http, ConnectionId, Identity, Timestamp};
@@ -1317,6 +1319,28 @@ impl TxSlot {
 
         let res = {
             scopeguard::defer_on_unwind! { remove_tx(); }
+            work()
+        };
+
+        let tx = remove_tx();
+        (tx, res)
+    }
+
+    /// Like [`Self::set`], but for the [`ReducerTxVariant::Batch`] lane.
+    ///
+    /// Used to run a reducer body against a `Send` [`BatchTxState`] overlay (on a
+    /// worker thread or inline on the home thread for a batch member).
+    pub fn set_batch<T>(&mut self, tx: BatchTxState, work: impl FnOnce() -> T) -> (BatchTxState, T) {
+        let prev = self.inner.lock().replace(ReducerTxVariant::Batch(tx));
+        assert!(prev.is_none(), "reentrant TxSlot::set_batch");
+
+        let remove_tx = || match self.inner.lock().take().expect("tx was removed during transaction") {
+            ReducerTxVariant::Batch(tx) => tx,
+            ReducerTxVariant::Mut(_) => panic!("TxSlot::set_batch expected a `Batch` variant"),
+        };
+
+        let res = {
+            scopeguard::defer_on_unwind! { let _ = remove_tx(); }
             work()
         };
 

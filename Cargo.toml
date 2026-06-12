@@ -42,6 +42,7 @@ members = [
   "crates/testing",
   "crates/update",
   "modules/access-analysis-fixture",
+  "modules/reducer-batching-fixture",
   "modules/benchmarks",
   "modules/keynote-benchmarks",
   "modules/perf-test",

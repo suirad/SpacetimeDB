@@ -1071,6 +1071,83 @@ impl Locking {
 
         Ok((tx_offset, tx_data, tx_metrics, reducer))
     }
+
+    /// Commit `finished`, invoke `before_downgrade` while the write lock is still held,
+    /// then atomically downgrade the write lock to a read lock, returning it as a [`TxId`].
+    ///
+    /// The downgrade is atomic (parking_lot ArcRwLockWriteGuard::downgrade) so no
+    /// writer can acquire the lock between commit and the caller's read view —
+    /// subscriber-duplicate protection in core depends on this ordering.
+    pub fn commit_batch_tx_downgrade_and_then(
+        &self,
+        finished: FinishedBatchTx,
+        workload: Workload,
+        before_downgrade: impl FnOnce(&Arc<TxData>),
+    ) -> (Arc<TxData>, TxMetrics, TxId) {
+        let FinishedBatchTx {
+            tx_state,
+            read_sets,
+            lock_wait_time,
+            timer,
+            mut ctx,
+            metrics,
+        } = finished;
+
+        let mut committed_state = self.committed_state.write_arc();
+
+        debug_assert!(
+            tx_state
+                .delete_tables
+                .iter()
+                .all(|(table_id, row_ptrs)| {
+                    committed_state
+                        .get_table(*table_id)
+                        .map(|table| {
+                            row_ptrs
+                                .iter()
+                                .all(|ptr| table.get_row_ref(&committed_state.blob_store, ptr).is_some())
+                        })
+                        .unwrap_or(true)
+                }),
+            "batch disjointness violated: a sibling commit invalidated this overlay's delete pointers"
+        );
+
+        debug_assert!(
+            !committed_state.view_read_overlap(
+                tx_state
+                    .insert_tables
+                    .keys()
+                    .chain(tx_state.delete_tables.keys())
+                    .copied()
+            ),
+            "admission invariant violated: batch member wrote a table with a live view read set"
+        );
+
+        let tx_data = committed_state.merge(tx_state, read_sets, &ctx);
+
+        let tx_metrics = TxMetrics::new(
+            &ctx,
+            timer,
+            lock_wait_time,
+            metrics,
+            true,
+            Some(&tx_data),
+            &committed_state,
+        );
+
+        let tx_data = Arc::new(tx_data);
+        before_downgrade(&tx_data);
+
+        ctx.workload = workload.workload_type();
+        let tx = TxId {
+            committed_state_shared_lock: parking_lot::lock_api::ArcRwLockWriteGuard::downgrade(committed_state),
+            lock_wait_time: Duration::ZERO,
+            timer: Instant::now(),
+            ctx,
+            metrics: ExecutionMetrics::default(),
+        };
+        (tx_data, tx_metrics, tx)
+    }
 }
 
 /// Construct a [`Metadata`] from the given [`RowRef`],

@@ -287,10 +287,10 @@ impl BatchTxState {
     }
 
     pub fn record_index_write(&mut self, op: &FuncCallType, index_id: IndexId) {
-        if matches!(op, FuncCallType::Reducer) && self.observed.is_some() {
-            if let Some((table_id, _, _)) = self.get_table_and_index(index_id) {
-                record_observed_write_inner(&mut self.observed, table_id);
-            }
+        if matches!(op, FuncCallType::Reducer) && self.observed.is_some()
+            && let Some((table_id, _, _)) = self.get_table_and_index(index_id)
+        {
+            record_observed_write_inner(&mut self.observed, table_id);
         }
     }
 
@@ -321,6 +321,13 @@ impl BatchTxState {
             ctx: self.ctx,
             metrics: self.metrics,
         }
+    }
+
+    /// Returns true iff any table in `tables` has a live view read-set entry,
+    /// evaluated under this batch's own committed-state read window so the check
+    /// races no concurrent writer.
+    pub fn view_read_overlap(&self, tables: impl Iterator<Item = TableId>) -> bool {
+        self.committed_state_read_lock.view_read_overlap(tables)
     }
 
     /// Discard the transaction and return metrics.
@@ -884,6 +891,121 @@ mod tests {
 
         assert_eq!(rows_a, vec![product![100u32]], "table a must contain only the new row");
         assert_eq!(rows_b, vec![product![200u32]], "table b must contain only the new row");
+
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // 5. Commit-downgrade: BatchTxState vs MutTxId produce the same TxData rows
+    //    and the returned TxId (read tx) can read the committed rows.
+    // -------------------------------------------------------------------------
+    #[test]
+    fn commit_downgrade_equivalence() -> crate::Result<()> {
+        use crate::execution_context::Workload;
+
+        let workload = Workload::Internal;
+
+        // Build two independent datastores and apply identical insert-then-commit
+        // operations — one via MutTxId+commit_mut_tx_downgrade, one via
+        // BatchTxState+commit_batch_tx_downgrade_and_then — then verify that the
+        // returned TxIds can read the committed rows and that TxData matches.
+
+        let setup = || -> crate::Result<(Locking, spacetimedb_primitives::TableId)> {
+            let ds = get_datastore()?;
+            let mut tx = ds.begin_mut_tx(IsolationLevel::Serializable, workload.clone());
+            tx.create_table(simple_schema("tbl"))?;
+            ds.commit_mut_tx(tx)?;
+            let rtx = ds.begin_mut_tx(IsolationLevel::Serializable, workload.clone());
+            let tid = rtx.table_id_from_name("tbl")?.unwrap();
+            let _ = ds.rollback_mut_tx(rtx);
+            Ok((ds, tid))
+        };
+
+        // ---- MutTxId path ----
+        let (ds_m, tid_m) = setup()?;
+        let mut mtx = ds_m.begin_mut_tx(IsolationLevel::Serializable, workload.clone());
+        for v in [10u32, 20, 30] {
+            let row = spacetimedb_sats::bsatn::to_vec(&product![v]).unwrap();
+            mtx.insert::<true>(tid_m, &row)?;
+        }
+        let (mut_tx_data, _metrics_m, read_tx_m) = ds_m.commit_mut_tx_downgrade(mtx, workload.clone());
+
+        // The returned read tx must see the committed rows.
+        let count_m = read_tx_m.iter(tid_m)?.count();
+        assert_eq!(count_m, 3, "MutTx downgrade: read tx must see 3 committed rows");
+        drop(read_tx_m);
+
+        // ---- BatchTxState path ----
+        let (ds_b, tid_b) = setup()?;
+        let mut btx = ds_b.begin_batch_tx(workload.clone());
+        for v in [10u32, 20, 30] {
+            let row = spacetimedb_sats::bsatn::to_vec(&product![v]).unwrap();
+            btx.insert::<true>(tid_b, &row)?;
+        }
+        let finished = btx.finish();
+        let (batch_tx_data, _metrics_b, read_tx_b) =
+            ds_b.commit_batch_tx_downgrade_and_then(finished, workload.clone(), |_| {});
+
+        // The returned read tx must see the committed rows.
+        let count_b = read_tx_b.iter(tid_b)?.count();
+        assert_eq!(count_b, 3, "BatchTx downgrade: read tx must see 3 committed rows");
+        drop(read_tx_b);
+
+        // TxData inserted rows must match (by value, keyed by table name).
+        let sort_pvs = |mut v: Vec<spacetimedb_sats::ProductValue>| {
+            v.sort_by_key(|r| format!("{r:?}"));
+            v
+        };
+        let inserts_m: Vec<_> = sort_pvs(
+            mut_tx_data
+                .inserts()
+                .flat_map(|(_, rows)| rows.iter().cloned())
+                .collect(),
+        );
+        let inserts_b: Vec<_> = sort_pvs(
+            batch_tx_data
+                .inserts()
+                .flat_map(|(_, rows)| rows.iter().cloned())
+                .collect(),
+        );
+        assert_eq!(inserts_m, inserts_b, "TxData inserted row values must match");
+
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // 6. Tripwire smoke: a batch member writing a table with no read-set entry
+    //    commits successfully (the admission debug_assert must not fire).
+    // -------------------------------------------------------------------------
+    #[test]
+    fn tripwire_smoke_no_view_overlap() -> crate::Result<()> {
+        use crate::execution_context::Workload;
+
+        let workload = Workload::Internal;
+        let ds = get_datastore()?;
+
+        let mut setup = ds.begin_mut_tx(IsolationLevel::Serializable, workload.clone());
+        setup.create_table(simple_schema("tbl"))?;
+        ds.commit_mut_tx(setup)?;
+
+        let rtx = ds.begin_mut_tx(IsolationLevel::Serializable, workload.clone());
+        let tid = rtx.table_id_from_name("tbl")?.unwrap();
+        let _ = ds.rollback_mut_tx(rtx);
+
+        // No view subscriptions exist → no read-set entries → tripwire must not fire.
+        let mut btx = ds.begin_batch_tx(workload.clone());
+        let row = spacetimedb_sats::bsatn::to_vec(&product![42u32]).unwrap();
+        btx.insert::<true>(tid, &row)?;
+        let finished = btx.finish();
+
+        // commit_batch_tx_downgrade_and_then contains the admission debug_assert;
+        // if it fires the test panics.
+        let (_tx_data, _metrics, read_tx) =
+            ds.commit_batch_tx_downgrade_and_then(finished, workload, |_| {});
+
+        let count = read_tx.iter(tid)?.count();
+        assert_eq!(count, 1, "committed row must be visible via returned read tx");
+        drop(read_tx);
 
         Ok(())
     }

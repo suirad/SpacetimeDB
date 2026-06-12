@@ -126,6 +126,11 @@ impl ViewReadSets {
         self.replacements.insert(call);
     }
 
+    /// Returns true if the given table has any read-set entry (full scan or index seek).
+    pub fn contains_table(&self, table_id: &TableId) -> bool {
+        self.tables.contains_key(table_id)
+    }
+
     /// Removes keys for `view_id` from the read set
     pub fn remove_view(&mut self, view_id: ViewId, sender: Option<Identity>) {
         self.tables.retain(|_, readset| {
@@ -431,10 +436,10 @@ impl MutTxId {
     /// Record a reducer write via `index_id`; resolves to parent table.
     /// If the index cannot be resolved the operation itself will fail, so skipping is sound.
     pub fn record_index_write(&mut self, op: &FuncCallType, index_id: IndexId) {
-        if matches!(op, FuncCallType::Reducer) && self.observed.is_some() {
-            if let Some((table_id, _, _)) = self.get_table_and_index(index_id) {
-                self.record_observed_write_table(table_id);
-            }
+        if matches!(op, FuncCallType::Reducer) && self.observed.is_some()
+            && let Some((table_id, _, _)) = self.get_table_and_index(index_id)
+        {
+            self.record_observed_write_table(table_id);
         }
     }
 
