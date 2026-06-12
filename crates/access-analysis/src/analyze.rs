@@ -46,6 +46,7 @@ pub fn analyze(wasm: &[u8], module_def: &ModuleDef) -> Result<Vec<AccessSet>, An
     let table_relevant = reachability::table_relevant_funcs(&module, &imports, &graph);
 
     let index_to_table = build_index_to_table(module_def);
+    let accessor_to_table = build_accessor_to_table(module_def);
 
     let reducer_names: Vec<&str> = module_def.reducers().map(|r| &*r.name).collect();
     let entries = reducers::locate(&module, &reducer_names);
@@ -58,6 +59,7 @@ pub fn analyze(wasm: &[u8], module_def: &ModuleDef) -> Result<Vec<AccessSet>, An
         indirect: &indirect,
         table_relevant: &table_relevant,
         index_to_table: &index_to_table,
+        accessor_to_table: &accessor_to_table,
         module_def,
     };
 
@@ -80,6 +82,7 @@ struct AnalyzeCtx<'a> {
     indirect: &'a IndirectTargets,
     table_relevant: &'a HashSet<FunctionId>,
     index_to_table: &'a HashMap<String, Identifier>,
+    accessor_to_table: &'a HashMap<String, Identifier>,
     module_def: &'a ModuleDef,
 }
 
@@ -214,8 +217,15 @@ impl AnalyzeCtx<'_> {
         Some(out)
     }
 
+    /// Resolve a table accessor name (recovered from a wasm const) to its
+    /// `ModuleDef` table identifier: raw accessor map first (see
+    /// `build_accessor_to_table` for why the names diverge), canonical name as
+    /// fallback. A still-missing name → `None` → wildcard.
     fn table_identifier(&self, name: &str) -> Option<Identifier> {
-        self.module_def.table(name).map(|t| t.name.clone())
+        self.accessor_to_table
+            .get(name)
+            .cloned()
+            .or_else(|| self.module_def.table(name).map(|t| t.name.clone()))
     }
 
     /// Map an index `source_name` (what `index_id_from_name` receives) to its
@@ -259,6 +269,21 @@ fn build_index_to_table(module_def: &ModuleDef) -> HashMap<String, Identifier> {
             // Also map `name` defensively (for V9 modules `name == source_name`).
             map.insert(index.name.to_string(), table.name.clone());
         }
+    }
+    map
+}
+
+/// Map each table's raw accessor name (what `table_id_from_name` receives) to its
+/// canonical `ModuleDef` table identifier.
+///
+/// WHY: `TableDef.accessor_name` preserves the raw source identifier while
+/// `TableDef.name` is snake-cased at letter-digit boundaries during validation;
+/// the wasm const carries the raw form, so accessor-keyed attribution must look
+/// up the raw name, not the canonical one.
+fn build_accessor_to_table(module_def: &ModuleDef) -> HashMap<String, Identifier> {
+    let mut map = HashMap::new();
+    for table in module_def.tables() {
+        map.insert(table.accessor_name.to_string(), table.name.clone());
     }
     map
 }

@@ -13,6 +13,7 @@ spacetimedb-schema.workspace = true
 spacetimedb-lib.workspace = true
 walrus.workspace = true
 thiserror.workspace = true
+convert_case.workspace = true
 
 [dev-dependencies]
 spacetimedb-testing = { path = "../testing" }

@@ -17,9 +17,34 @@ pub struct TableB {
     pub value: u64,
 }
 
+/// Accessor `c2` has a letter-digit boundary, so schema snake-cases the
+/// ModuleDef table name to `c_2` while the wasm const keeps the raw `c2`.
+/// Exercises the table-name (accessor) snake-case fallback in `analyze`.
+#[spacetimedb::table(accessor = c2)]
+pub struct TableC2 {
+    #[primary_key]
+    pub id: u64,
+    pub value: u64,
+}
+
 #[spacetimedb::reducer]
 pub fn writes_a(ctx: &ReducerContext) {
     ctx.db.a().insert(TableA { id: 1, value: 1 });
+}
+
+/// Digit-adjacent name: Rust ident `writes_a_v2`, ModuleDef snake-case `writes_a_v_2`.
+/// Exercises the describer-export fallback in `reducers::locate`.
+#[spacetimedb::reducer]
+pub fn writes_a_v2(ctx: &ReducerContext) {
+    ctx.db.a().insert(TableA { id: 2, value: 2 });
+}
+
+/// Digit-FREE reducer name (so the reducer-body path resolves trivially),
+/// writing a digit-bearing-accessor table. Isolates the table-name accessor
+/// snake-case path (`c2` → ModuleDef `c_2`) from the reducer-name path.
+#[spacetimedb::reducer]
+pub fn writes_table_two(ctx: &ReducerContext) {
+    ctx.db.c2().insert(TableC2 { id: 1, value: 1 });
 }
 
 #[spacetimedb::reducer]

@@ -7755,6 +7755,7 @@ dependencies = [
 name = "spacetimedb-access-analysis"
 version = "2.5.0"
 dependencies = [
+ "convert_case 0.6.0",
  "spacetimedb-lib",
  "spacetimedb-schema",
  "spacetimedb-testing",

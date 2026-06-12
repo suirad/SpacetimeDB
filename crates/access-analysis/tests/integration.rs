@@ -89,16 +89,27 @@ fn run_fixture(mode: CompilationMode) {
     if exact {
         // Debug: helpers aren't inlined, so the split is exact and minimal.
         assert_reads_writes(&sets["writes_a"], &[], &["a"]);
+        // Map key is the snake-cased ModuleDef name `writes_a_v_2`, NOT the Rust
+        // ident `writes_a_v2`; this exercises the describer-export fallback.
+        assert_reads_writes(&sets["writes_a_v_2"], &[], &["a"]);
         assert_reads_writes(&sets["reads_b"], &["b"], &[]);
         assert_reads_writes(&sets["reads_a_writes_b"], &["a"], &["b"]);
         assert_reads_writes(&sets["touches_both"], &["a", "b"], &["a", "b"]);
+        // Digit-free reducer, digit-bearing accessor `c2`. The ModuleDef table
+        // name is snake-cased to `c_2`; this exercises the accessor snake-case
+        // fallback in `analyze` (bug 2), independent of the reducer-name path.
+        assert_reads_writes(&sets["writes_table_two"], &[], &["c_2"]);
     } else {
         // Release: inlining into the invoke wrapper can over-approximate (sound),
         // so we only require zero under-approximation within each universe.
         assert_sound_superset(&sets["writes_a"], &[], &["a"], &["a"]);
+        // Structurally identical to `writes_a` (a single insert into `a`), so the
+        // sound-superset universe is the same tight `["a"]`.
+        assert_sound_superset(&sets["writes_a_v_2"], &[], &["a"], &["a"]);
         assert_sound_superset(&sets["reads_b"], &["b"], &[], &["b"]);
         assert_sound_superset(&sets["reads_a_writes_b"], &["a"], &["b"], &["a", "b"]);
         assert_sound_superset(&sets["touches_both"], &["a", "b"], &["a", "b"], &["a", "b"]);
+        assert_sound_superset(&sets["writes_table_two"], &[], &["c_2"], &["c_2"]);
     }
 
     // The crux (both modes): writes_a.writes must be disjoint from reads_b.reads,
