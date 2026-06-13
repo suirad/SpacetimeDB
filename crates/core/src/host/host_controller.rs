@@ -33,6 +33,7 @@ use spacetimedb_data_structures::map::{IntMap, IntSet};
 use spacetimedb_datastore::db_metrics::data_size::DATA_SIZE_METRICS;
 use spacetimedb_datastore::db_metrics::DB_METRICS;
 use spacetimedb_datastore::execution_context::Workload;
+use spacetimedb_datastore::locking_tx_datastore::ObservedAccess;
 use spacetimedb_datastore::system_tables::ModuleKind;
 use spacetimedb_datastore::traits::Program;
 use spacetimedb_durability::{self as durability};
@@ -150,6 +151,7 @@ pub struct ReducerCallResult {
     pub outcome: ReducerOutcome,
     pub execution_budget_used: FunctionBudget,
     pub execution_duration: Duration,
+    pub observed: Option<Box<ObservedAccess>>,
 }
 
 impl ReducerCallResult {

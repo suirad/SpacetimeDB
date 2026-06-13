@@ -19,6 +19,14 @@ pub struct TableB {
     pub val: u64,
 }
 
+// Flag table for data-dependent access in heavy_learn.
+#[spacetimedb::table(accessor = flag, public)]
+pub struct Flag {
+    #[primary_key]
+    pub id: u64,
+    pub on: bool,
+}
+
 #[spacetimedb::table(accessor = table_c, public)]
 pub struct TableC {
     #[auto_inc]
@@ -121,9 +129,45 @@ pub fn heavy_panic(ctx: &ReducerContext, n: u64) {
     panic!("intentional reducer panic for trap-recovery test");
 }
 
-/// Log the current row counts for all seven tables so tests can assert DB
-/// consistency without a SQL helper. Format keeps `a=X b=Y` as a prefix so
-/// existing two-field parsers still work; c–g follow.
+/// Upsert Flag{id=0, on}.  Tiny reducer; touches only the flag table so it
+/// never perturbs heavy_learn's learned write set.
+#[spacetimedb::reducer]
+pub fn set_flag(ctx: &ReducerContext, on: bool) {
+    ctx.db.flag().id().delete(&0);
+    ctx.db.flag().insert(Flag { id: 0, on });
+}
+
+fn write_n_to_a(ctx: &ReducerContext, n: u64) {
+    for i in 0..n {
+        ctx.db.table_a().insert(TableA { id: 0, val: i });
+    }
+}
+
+fn write_n_to_b(ctx: &ReducerContext, n: u64) {
+    for i in 0..n {
+        ctx.db.table_b().insert(TableB { id: 0, val: i });
+    }
+}
+
+// Dispatching writes through a fn-pointer slice forces a call_indirect whose
+// possible targets (element-segment ∩ type) both touch tables, so the analyzer
+// cannot bound the access set and wildcards heavy_learn — but ONLY in Debug;
+// Release inlines the constant index, so the learning tests build the fixture Debug.
+static WRITERS: &[fn(&ReducerContext, u64)] = &[write_n_to_a, write_n_to_b];
+
+/// Actual access is data-dependent: flag OFF → writes table_a only; flag ON → also
+/// writes table_b (the escape that trips the trap once table_a was learned).
+#[spacetimedb::reducer]
+pub fn heavy_learn(ctx: &ReducerContext, n: u64) {
+    WRITERS[0](ctx, n);
+    let flag_on = ctx.db.flag().id().find(&0).map(|f| f.on).unwrap_or(false);
+    if flag_on {
+        WRITERS[1](ctx, n);
+    }
+}
+
+/// Log the current row counts. Format keeps `a=X b=Y` as a prefix so existing
+/// two-field parsers still work; c–g follow.
 #[spacetimedb::reducer]
 pub fn log_counts(ctx: &ReducerContext) {
     let a = ctx.db.table_a().count();

@@ -1113,14 +1113,8 @@ impl Locking {
         );
 
         debug_assert!(
-            !committed_state.view_read_overlap(
-                tx_state
-                    .insert_tables
-                    .keys()
-                    .chain(tx_state.delete_tables.keys())
-                    .copied()
-            ),
-            "admission invariant violated: batch member wrote a table with a live view read set"
+            !super::batch_tx::view_refresh_required(&committed_state, &tx_state),
+            "batch integrity violated: a batch commit requires a view refresh the batch lane cannot perform"
         );
 
         let tx_data = committed_state.merge(tx_state, read_sets, &ctx);

@@ -178,7 +178,7 @@ impl ViewReadSets {
 }
 
 /// Per-reducer table access capture, populated during execution when enabled.
-#[derive(Default)]
+#[derive(Default, Clone, Debug)]
 pub struct ObservedAccess {
     pub reads: IntSet<TableId>,
     pub writes: IntSet<TableId>,

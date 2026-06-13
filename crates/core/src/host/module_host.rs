@@ -754,6 +754,7 @@ pub struct CallReducerParams {
     pub timer: Option<Instant>,
     pub reducer_id: ReducerId,
     pub args: ArgsTuple,
+    pub capture_access: bool,
 }
 
 impl CallReducerParams {
@@ -774,6 +775,7 @@ impl CallReducerParams {
             timer: None,
             reducer_id,
             args,
+            capture_access: false,
         }
     }
 }
@@ -2226,6 +2228,7 @@ impl ModuleHost {
             timer,
             reducer_id,
             args,
+            capture_access: false,
         })
     }
 

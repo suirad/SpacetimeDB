@@ -39,7 +39,7 @@ use spacetimedb_datastore::db_metrics::DB_METRICS;
 use spacetimedb_datastore::error::{DatastoreError, ViewError};
 use spacetimedb_datastore::execution_context::{self, ReducerContext, Workload};
 use spacetimedb_datastore::locking_tx_datastore::batch_tx::{BatchTxState, FinishedBatchTx};
-use spacetimedb_datastore::locking_tx_datastore::{FuncCallType, MutTxId, ViewCallInfo};
+use spacetimedb_datastore::locking_tx_datastore::{FuncCallType, MutTxId, ObservedAccess, ViewCallInfo};
 use spacetimedb_datastore::traits::{IsolationLevel, Program};
 use spacetimedb_execution::ExecutionParams;
 use spacetimedb_lib::buffer::DecodeError;
@@ -627,10 +627,23 @@ impl<T: WasmInstance> WasmModuleInstance<T> {
         &mut self,
         tx: BatchTxState,
         params: CallReducerParams,
+        capture: CaptureSpec,
     ) -> BatchBodyOutcome {
-        let outcome = self.common.call_reducer_body_batch(tx, params, &mut self.instance);
+        let outcome = self.common.call_reducer_body_batch(tx, params, capture, &mut self.instance);
         self.trapped = outcome.trapped;
         outcome
+    }
+
+    /// Record drained-body energy at commit time (charge-committed-only for batch bodies).
+    pub(crate) fn record_reducer_energy(
+        &mut self,
+        reducer_id: ReducerId,
+        caller_identity: Identity,
+        used: FunctionBudget,
+        duration: Duration,
+    ) {
+        self.common
+            .record_reducer_energy(reducer_id, caller_identity, used, duration);
     }
 }
 
@@ -643,6 +656,12 @@ struct ReducerBodyOutcome {
     total_duration: Duration,
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CaptureSpec {
+    pub capture_access: bool,
+    pub check_views: bool,
+}
+
 pub(crate) struct BatchBodyOutcome {
     /// `None` means the body failed; the overlay was already rolled back.
     pub finished: Option<FinishedBatchTx>,
@@ -652,6 +671,8 @@ pub(crate) struct BatchBodyOutcome {
     pub execution_budget_used: FunctionBudget,
     pub host_execution_duration: Duration,
     pub trapped: bool,
+    pub observed: Option<Box<ObservedAccess>>,
+    pub view_refresh_needed: bool,
 }
 
 pub struct InstanceCommon {
@@ -1002,7 +1023,12 @@ impl InstanceCommon {
             reducer_id,
             args,
             timer,
+            capture_access,
         } = params;
+        debug_assert!(
+            tx.is_none() || !capture_access,
+            "capture is a typed-lane (scheduler) feature; pre-created-tx calls must not request it"
+        );
         let caller_connection_id_opt = (caller_connection_id != ConnectionId::ZERO).then_some(caller_connection_id);
 
         let replica_ctx = inst.replica_ctx();
@@ -1025,15 +1051,21 @@ impl InstanceCommon {
         };
 
         let workload = Workload::Reducer(ReducerContext::from(op.clone()));
-        let tx = tx.unwrap_or_else(|| stdb.begin_mut_tx(IsolationLevel::Serializable, workload));
+        let mut tx = tx.unwrap_or_else(|| stdb.begin_mut_tx(IsolationLevel::Serializable, workload));
+        if capture_access {
+            tx.enable_access_capture();
+        }
         let mut tx_slot = inst.tx_slot();
 
         let vm_metrics = self.vm_metrics.get_for_reducer_id(reducer_id);
         let _guard = vm_metrics.timer_guard_for_reducer_plus_query(tx.timer);
 
         let (mut tx, result) = tx_slot.set(tx, || {
-            self.call_function(caller_identity, reducer_name, |budget| inst.call_reducer(op, budget))
+            self.call_function(caller_identity, reducer_name, true, |budget| inst.call_reducer(op, budget))
         });
+
+        // Take before view execution: views must not pollute the reducer's observed set.
+        let observed = tx.take_observed();
 
         let ReducerBodyOutcome {
             status,
@@ -1115,6 +1147,7 @@ impl InstanceCommon {
             outcome: ReducerOutcome::from(&event.status),
             execution_budget_used,
             execution_duration: total_duration,
+            observed,
         };
 
         (res, trapped)
@@ -1180,8 +1213,9 @@ impl InstanceCommon {
     /// worker thread and never deadlocks against sibling overlays.
     pub(crate) fn call_reducer_body_batch<I: WasmInstance>(
         &mut self,
-        tx: BatchTxState,
+        mut tx: BatchTxState,
         params: CallReducerParams,
+        capture: CaptureSpec,
         inst: &mut I,
     ) -> BatchBodyOutcome {
         let CallReducerParams {
@@ -1193,6 +1227,7 @@ impl InstanceCommon {
             timer,
             reducer_id,
             args,
+            capture_access: _,
         } = params;
         let caller_connection_id_opt = (caller_connection_id != ConnectionId::ZERO).then_some(caller_connection_id);
 
@@ -1222,9 +1257,18 @@ impl InstanceCommon {
         let vm_metrics = self.vm_metrics.get_for_reducer_id(reducer_id);
         let _guard = vm_metrics.timer_guard_for_reducer_plus_query(tx.timer);
 
-        let (tx, result) = tx_slot.set_batch(tx, || {
-            self.call_function(caller_identity, reducer_name, |budget| inst.call_reducer(op, budget))
+        if capture.capture_access {
+            tx.enable_access_capture();
+        }
+
+        // Charge-committed-only: batch bodies skip energy recording here; the drain
+        // records only for outcomes that actually commit (the host eats speculation losses).
+        let (mut tx, result) = tx_slot.set_batch(tx, || {
+            self.call_function(caller_identity, reducer_name, false, |budget| inst.call_reducer(op, budget))
         });
+
+        // Take before the finish/rollback branch so failed bodies still yield their observed set.
+        let observed = tx.take_observed();
 
         let ReducerBodyOutcome {
             status,
@@ -1236,7 +1280,9 @@ impl InstanceCommon {
 
         // On success keep the overlay for the deferred commit; on failure/trap roll
         // it back here and report metrics as the Mut error path does on rollback.
-        let finished = if matches!(status, EventStatus::Committed(_)) {
+        let committed = matches!(status, EventStatus::Committed(_));
+        let view_refresh_needed = capture.check_views && committed && tx.view_refresh_nonempty();
+        let finished = if committed {
             Some(tx.finish())
         } else {
             let (tx_metrics, reducer) = tx.rollback();
@@ -1269,6 +1315,8 @@ impl InstanceCommon {
             execution_budget_used,
             host_execution_duration: total_duration,
             trapped,
+            observed,
+            view_refresh_needed,
         }
     }
 
@@ -1286,10 +1334,14 @@ impl InstanceCommon {
     }
 
     /// Calls a function (reducer, view) and performs energy monitoring.
+    ///
+    /// `record_energy` is `false` for batch bodies, which defer energy recording to the
+    /// drain (charge-committed-only); budget acquisition is unchanged in either case.
     fn call_function<F, R: AsRef<ExecutionStats>>(
         &mut self,
         caller_identity: Identity,
         function_name: &str,
+        record_energy: bool,
         vm_call_function: F,
     ) -> R
     where
@@ -1311,8 +1363,10 @@ impl InstanceCommon {
         let execution_budget_used = stats.energy.used();
         let timings = &stats.timings;
 
-        self.energy_monitor
-            .record_reducer(&energy_fingerprint, execution_budget_used, timings.total_duration);
+        if record_energy {
+            self.energy_monitor
+                .record_reducer(&energy_fingerprint, execution_budget_used, timings.total_duration);
+        }
 
         maybe_log_long_running_function(function_name, timings.total_duration);
 
@@ -1321,6 +1375,25 @@ impl InstanceCommon {
             .record("energy.used", tracing::field::debug(execution_budget_used));
 
         result
+    }
+
+    /// Record drained-body energy at commit time (charge-committed-only for batch bodies),
+    /// rebuilding the `FunctionFingerprint` exactly as [`Self::call_function`] does.
+    pub(crate) fn record_reducer_energy(
+        &mut self,
+        reducer_id: ReducerId,
+        caller_identity: Identity,
+        used: FunctionBudget,
+        duration: Duration,
+    ) {
+        let energy_fingerprint = FunctionFingerprint {
+            module_hash: self.info.module_hash,
+            module_identity: self.info.owner_identity,
+            caller_identity,
+            function_name: self.info.module_def.reducer_by_id(reducer_id).name.as_ref(),
+        };
+        self.energy_monitor
+            .record_reducer(&energy_fingerprint, used, duration);
     }
 
     pub(crate) fn handle_cmd<I: WasmInstance>(&mut self, cmds: ViewCommand, inst: &mut I) -> (ViewCommandResult, bool) {
@@ -1477,7 +1550,7 @@ impl InstanceCommon {
 
         let mut tx_slot = inst.tx_slot();
         let (mut tx, result) = tx_slot.set(tx, || {
-            self.call_function(caller, &view_name, |budget| match sender {
+            self.call_function(caller, &view_name, true, |budget| match sender {
                 Some(sender) => inst.call_view(
                     ViewOp {
                         name: &view_name,

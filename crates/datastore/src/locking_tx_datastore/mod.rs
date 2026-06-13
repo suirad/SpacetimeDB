@@ -18,6 +18,7 @@ pub use tx_state::PendingSchemaChange;
 
 pub mod batch_tx;
 pub use batch_tx::{BatchTxState, FinishedBatchTx};
+pub use committed_state::ViewOverlapKind;
 mod reducer_tx;
 pub use reducer_tx::{ReducerTx, ReducerTxVariant};
 

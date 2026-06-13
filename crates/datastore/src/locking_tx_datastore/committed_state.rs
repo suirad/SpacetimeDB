@@ -49,6 +49,14 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use thin_vec::ThinVec;
 
+/// Classifies the intersection of a written-table set with committed view read sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewOverlapKind {
+    None,
+    KeyOnly,
+    FullScan,
+}
+
 /// Contains the live, in-memory snapshot of a database. This structure
 /// is exposed in order to support tools wanting to process the commit
 /// logs directly. For normal usage, see the RelationalDB struct instead.
@@ -100,6 +108,20 @@ impl CommittedState {
     /// view refresh inside the reducer tx, which the batch path never runs.
     pub fn view_read_overlap(&self, mut tables: impl Iterator<Item = TableId>) -> bool {
         tables.any(|tid| self.read_sets.contains_table(&tid))
+    }
+
+    /// Classify the written-table set against committed view read sets.
+    pub fn view_overlap_kind(&self, tables: impl Iterator<Item = TableId>) -> ViewOverlapKind {
+        let mut has_key = false;
+        for t in tables {
+            if self.read_sets.views_for_table_scan(&t).next().is_some() {
+                return ViewOverlapKind::FullScan;
+            }
+            if self.read_sets.contains_table(&t) {
+                has_key = true;
+            }
+        }
+        if has_key { ViewOverlapKind::KeyOnly } else { ViewOverlapKind::None }
     }
 
     /// Returns the views that perform a full scan of this table

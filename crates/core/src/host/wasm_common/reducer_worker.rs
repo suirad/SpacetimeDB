@@ -1,6 +1,6 @@
 use crate::db::relational_db::RelationalDB;
 use crate::host::module_host::CallReducerParams;
-use crate::host::wasm_common::module_host_actor::{BatchBodyOutcome, WasmInstance, WasmModuleInstance};
+use crate::host::wasm_common::module_host_actor::{BatchBodyOutcome, CaptureSpec, WasmInstance, WasmModuleInstance};
 use spacetimedb_datastore::execution_context::Workload;
 use spacetimedb_datastore::locking_tx_datastore::batch_tx::BatchTxState;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,6 +20,7 @@ pub(crate) struct ReducerWorker {
 pub(crate) struct BatchRunJob {
     pub params: CallReducerParams,
     pub tx: BatchTxState,
+    pub capture: CaptureSpec,
 }
 
 pub(crate) struct BatchRunReply {
@@ -42,13 +43,13 @@ enum WorkerJob {
 /// Not `Send` — values live entirely on the worker thread (created inside `make_instance`).
 #[allow(dead_code)] // production worker calls `call_reducer_body_batch` directly; trait is test-only.
 trait RunReducerBody: 'static {
-    fn run_body(&mut self, tx: BatchTxState, params: CallReducerParams) -> BatchBodyOutcome;
+    fn run_body(&mut self, tx: BatchTxState, params: CallReducerParams, capture: CaptureSpec) -> BatchBodyOutcome;
     fn needs_replacement(&self) -> bool;
 }
 
 impl<I: WasmInstance + 'static> RunReducerBody for WasmModuleInstance<I> {
-    fn run_body(&mut self, tx: BatchTxState, params: CallReducerParams) -> BatchBodyOutcome {
-        self.call_reducer_body_batch(tx, params)
+    fn run_body(&mut self, tx: BatchTxState, params: CallReducerParams, capture: CaptureSpec) -> BatchBodyOutcome {
+        self.call_reducer_body_batch(tx, params, capture)
     }
 
     fn needs_replacement(&self) -> bool {
@@ -163,8 +164,8 @@ fn run_worker_loop<I, F>(
             }
 
             WorkerJob::Run { job, reply } => {
-                let BatchRunJob { params, tx } = *job;
-                let outcome = instance.call_reducer_body_batch(tx, params);
+                let BatchRunJob { params, tx, capture } = *job;
+                let outcome = instance.call_reducer_body_batch(tx, params, capture);
                 let trapped = outcome.trapped;
 
                 let _ = reply.send(BatchRunReply { outcome });
@@ -198,19 +199,24 @@ mod tests {
 
     struct FakeInstance {
         call_log: Arc<Mutex<Vec<u32>>>,
+        /// Records the `capture_access` flag of each dispatched job, in order.
+        capture_log: Arc<Mutex<Vec<bool>>>,
     }
 
     impl RunReducerBody for FakeInstance {
-        fn run_body(&mut self, tx: BatchTxState, params: CallReducerParams) -> BatchBodyOutcome {
+        fn run_body(&mut self, tx: BatchTxState, params: CallReducerParams, capture: CaptureSpec) -> BatchBodyOutcome {
             // finish() drops the read guard so the home thread can later commit.
             let _finished = tx.finish();
             self.call_log.lock().unwrap().push(u32::from(params.reducer_id));
+            self.capture_log.lock().unwrap().push(capture.capture_access);
             BatchBodyOutcome {
                 finished: None,
                 event: stub_event(),
                 execution_budget_used: FunctionBudget::ZERO,
                 host_execution_duration: Duration::ZERO,
                 trapped: false,
+                observed: None,
+                view_refresh_needed: false,
             }
         }
 
@@ -263,8 +269,8 @@ mod tests {
                         let _ = reply.send(());
                     }
                     WorkerJob::Run { job, reply } => {
-                        let BatchRunJob { params, tx } = *job;
-                        let outcome = instance.run_body(tx, params);
+                        let BatchRunJob { params, tx, capture } = *job;
+                        let outcome = instance.run_body(tx, params, capture);
                         let trapped = outcome.trapped;
                         let _ = reply.send(BatchRunReply { outcome });
                         if trapped {
@@ -305,18 +311,28 @@ mod tests {
             reducer_id: ReducerId::from(seq as u32),
             args: ArgsTuple::nullary(),
             timer: None,
+            capture_access: false,
         }
     }
 
     // ── Test cases ─────────────────────────────────────────────────────────────
 
+    type CallLog = Arc<Mutex<Vec<u32>>>;
+    type CaptureLog = Arc<Mutex<Vec<bool>>>;
+
+    fn new_logs() -> (CallLog, CaptureLog) {
+        (Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())))
+    }
+
     #[test]
     fn spawn_becomes_ready() {
         let db = make_test_db();
-        let calls = Arc::new(Mutex::new(Vec::<u32>::new()));
+        let (calls, captures) = new_logs();
         let calls_c = Arc::clone(&calls);
+        let captures_c = Arc::clone(&captures);
         let (_, ready, join) = spawn_fake(Arc::clone(&db), move || FakeInstance {
             call_log: Arc::clone(&calls_c),
+            capture_log: Arc::clone(&captures_c),
         });
         wait_ready(&ready);
         assert!(ready.load(Ordering::Acquire));
@@ -326,10 +342,12 @@ mod tests {
     #[test]
     fn calibrate_returns_a_duration() {
         let db = make_test_db();
-        let calls = Arc::new(Mutex::new(Vec::<u32>::new()));
+        let (calls, captures) = new_logs();
         let calls_c = Arc::clone(&calls);
+        let captures_c = Arc::clone(&captures);
         let (job_tx, ready, _join) = spawn_fake(Arc::clone(&db), move || FakeInstance {
             call_log: Arc::clone(&calls_c),
+            capture_log: Arc::clone(&captures_c),
         });
         wait_ready(&ready);
 
@@ -345,10 +363,12 @@ mod tests {
     #[test]
     fn dispatch_recv_returns_outcome() {
         let db = make_test_db();
-        let calls = Arc::new(Mutex::new(Vec::<u32>::new()));
+        let (calls, captures) = new_logs();
         let calls_c = Arc::clone(&calls);
+        let captures_c = Arc::clone(&captures);
         let (job_tx, ready, _join) = spawn_fake(Arc::clone(&db), move || FakeInstance {
             call_log: Arc::clone(&calls_c),
+            capture_log: Arc::clone(&captures_c),
         });
         wait_ready(&ready);
 
@@ -356,7 +376,11 @@ mod tests {
         let (reply_tx, reply_rx) = mpsc::channel();
         job_tx
             .send(WorkerJob::Run {
-                job: Box::new(BatchRunJob { params: stub_params(77), tx }),
+                job: Box::new(BatchRunJob {
+                    params: stub_params(77),
+                    tx,
+                    capture: CaptureSpec::default(),
+                }),
                 reply: reply_tx,
             })
             .unwrap();
@@ -364,13 +388,51 @@ mod tests {
         assert!(!reply.outcome.trapped);
     }
 
+    /// A dispatched job's `capture` flag must reach `run_body` unchanged.
+    #[test]
+    fn capture_flag_reaches_run_body() {
+        let db = make_test_db();
+        let (calls, captures) = new_logs();
+        let calls_c = Arc::clone(&calls);
+        let captures_c = Arc::clone(&captures);
+        let (job_tx, ready, _join) = spawn_fake(Arc::clone(&db), move || FakeInstance {
+            call_log: Arc::clone(&calls_c),
+            capture_log: Arc::clone(&captures_c),
+        });
+        wait_ready(&ready);
+
+        // Dispatch one job with capture on, one with it off.
+        for capture_access in [true, false] {
+            let tx = db.begin_batch_tx(Workload::Internal);
+            let (reply_tx, reply_rx) = mpsc::channel();
+            job_tx
+                .send(WorkerJob::Run {
+                    job: Box::new(BatchRunJob {
+                        params: stub_params(1),
+                        tx,
+                        capture: CaptureSpec {
+                            capture_access,
+                            check_views: false,
+                        },
+                    }),
+                    reply: reply_tx,
+                })
+                .unwrap();
+            reply_rx.recv().expect("run reply");
+        }
+
+        assert_eq!(*captures.lock().unwrap(), vec![true, false]);
+    }
+
     #[test]
     fn drop_exits_thread() {
         let db = make_test_db();
-        let calls = Arc::new(Mutex::new(Vec::<u32>::new()));
+        let (calls, captures) = new_logs();
         let calls_c = Arc::clone(&calls);
+        let captures_c = Arc::clone(&captures);
         let (job_tx, ready, join) = spawn_fake(Arc::clone(&db), move || FakeInstance {
             call_log: Arc::clone(&calls_c),
+            capture_log: Arc::clone(&captures_c),
         });
         wait_ready(&ready);
 

@@ -22,25 +22,27 @@ pub(crate) struct ReducerAccessInfo {
     /// `lifecycle[i]` is `true` iff reducer `i` is a lifecycle reducer (excluded from batch admission).
     pub lifecycle: Vec<bool>,
     /// `wildcard[i]` is `true` iff the static analyzer set the wildcard flag for reducer `i`.
-    /// Distinct from `ResolvedWrites::wildcard` which additionally includes name-resolution failures.
+    /// Distinct from `ResolvedAccess::wildcard` which additionally includes name-resolution failures.
     pub wildcard: Vec<bool>,
     /// Name→`TableId` mapping, resolved lazily on first access to a live datastore.
-    resolved: OnceLock<ResolvedWrites>,
+    resolved: OnceLock<ResolvedAccess>,
 }
 
-pub(crate) struct ResolvedWrites {
+pub(crate) struct ResolvedAccess {
+    /// Resolved read-table ids per reducer (empty for wildcard reducers).
+    pub read_tables: Vec<Vec<TableId>>,
     /// Resolved write-table ids per reducer (empty for readers / wildcard reducers).
     pub write_tables: Vec<Vec<TableId>>,
     /// `wildcard[i]` is true if reducer i should be treated as conflicting with everything:
-    /// either the analyzer set the wildcard flag, or at least one write-set table name could
+    /// either the analyzer set the wildcard flag, or at least one table name could
     /// not be resolved at the time of resolution (sound: over-approximation).
     pub wildcard: Vec<bool>,
 }
 
-impl ResolvedWrites {
+impl ResolvedAccess {
     #[cfg(test)]
-    pub(crate) fn for_test(write_tables: Vec<Vec<TableId>>, wildcard: Vec<bool>) -> Self {
-        Self { write_tables, wildcard }
+    pub(crate) fn for_test(read_tables: Vec<Vec<TableId>>, write_tables: Vec<Vec<TableId>>, wildcard: Vec<bool>) -> Self {
+        Self { read_tables, write_tables, wildcard }
     }
 }
 
@@ -84,7 +86,7 @@ impl ReducerAccessInfo {
     }
 
     /// The `resolved` OnceLock starts empty; callers needing `resolved()` must use a live DB
-    /// or supply a separately-constructed [`ResolvedWrites`].
+    /// or supply a separately-constructed [`ResolvedAccess`].
     #[cfg(test)]
     pub(crate) fn for_test(sets: Vec<AccessSet>, lifecycle: Vec<bool>) -> Self {
         let matrix = ConflictMatrix::build(&sets);
@@ -102,48 +104,51 @@ impl ReducerAccessInfo {
     ///
     /// Must not be called before the datastore exists (e.g. during initial publish).
     /// Unknown table names are wildcarded (sound over-approximation).
-    pub fn resolved(&self, db: &RelationalDB) -> &ResolvedWrites {
+    pub fn resolved(&self, db: &RelationalDB) -> &ResolvedAccess {
         self.resolved.get_or_init(|| {
             db.with_read_only(Workload::Internal, |tx| {
-                let mut write_tables = Vec::with_capacity(self.sets.len());
-                let mut wildcard = Vec::with_capacity(self.sets.len());
-
-                for set in &self.sets {
-                    if set.wildcard {
-                        write_tables.push(Vec::new());
-                        wildcard.push(true);
-                        continue;
-                    }
-
-                    let mut ids = Vec::with_capacity(set.writes.len());
-                    let mut is_wildcard = false;
-
-                    for name in &set.writes {
+                // Resolve an iterator of Identifier names to ids; returns None if any name fails.
+                let resolve_names = |names: &mut dyn Iterator<Item = &spacetimedb_schema::identifier::Identifier>| -> Option<Vec<TableId>> {
+                    let mut ids = Vec::new();
+                    for name in names {
                         match db.table_id_from_name(tx, name) {
                             Ok(Some(id)) => ids.push(id),
-                            Ok(None) => {
-                                // Table name present in access set but absent from schema;
-                                // wildcard this reducer (sound over-approximation).
-                                is_wildcard = true;
-                                break;
-                            }
+                            Ok(None) => return None,
                             Err(err) => {
                                 log::warn!(
                                     "failed to resolve table '{}' during access-set resolution, \
                                      treating reducer as wildcard: {err}",
                                     &**name
                                 );
-                                is_wildcard = true;
-                                break;
+                                return None;
                             }
                         }
                     }
+                    Some(ids)
+                };
 
-                    write_tables.push(if is_wildcard { Vec::new() } else { ids });
+                let mut read_tables = Vec::with_capacity(self.sets.len());
+                let mut write_tables = Vec::with_capacity(self.sets.len());
+                let mut wildcard = Vec::with_capacity(self.sets.len());
+
+                for set in &self.sets {
+                    if set.wildcard {
+                        read_tables.push(Vec::new());
+                        write_tables.push(Vec::new());
+                        wildcard.push(true);
+                        continue;
+                    }
+
+                    let read_ids = resolve_names(&mut set.reads.iter());
+                    let write_ids = resolve_names(&mut set.writes.iter());
+
+                    let is_wildcard = read_ids.is_none() || write_ids.is_none();
+                    read_tables.push(if is_wildcard { Vec::new() } else { read_ids.unwrap() });
+                    write_tables.push(if is_wildcard { Vec::new() } else { write_ids.unwrap() });
                     wildcard.push(is_wildcard);
                 }
 
-                ResolvedWrites { write_tables, wildcard }
+                ResolvedAccess { read_tables, write_tables, wildcard }
             })
         })
     }
