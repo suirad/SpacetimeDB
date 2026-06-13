@@ -1,3 +1,4 @@
+use super::reducer_scheduler::{BatchingExecutor, ReducerGlue};
 use super::{
     ArgsTuple, FunctionArgs, InvalidProcedureArguments, InvalidReducerArguments, ReducerCallResult, ReducerId,
     ReducerOutcome, Scheduler,
@@ -27,7 +28,6 @@ use crate::subscription::row_list_builder_pool::{BsatnRowListBuilderPool, JsonRo
 use crate::subscription::tx::DeltaTx;
 use crate::subscription::websocket_building::{BuildableWebsocketFormat, RowListBuilderSource};
 use crate::subscription::{execute_plan, execute_plan_for_view};
-use super::reducer_scheduler::{BatchingExecutor, ReducerGlue};
 use crate::util::jobs::AllocatedJobCore;
 use crate::worker_metrics::WORKER_METRICS;
 use anyhow::Context;

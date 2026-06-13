@@ -136,17 +136,15 @@ impl AnalyzeCtx<'_> {
         let mut found: Option<HostImport> = None;
         for f in &fwd {
             match self.imports.get(*f) {
-                Some(host @ HostImport::TableOp { class, id_kind }) => {
-                    match found {
-                        None => found = Some(host),
-                        Some(HostImport::TableOp { class: c2, id_kind: k2 }) => {
-                            if c2 != class || k2 != id_kind {
-                                return None;
-                            }
+                Some(host @ HostImport::TableOp { class, id_kind }) => match found {
+                    None => found = Some(host),
+                    Some(HostImport::TableOp { class: c2, id_kind: k2 }) => {
+                        if c2 != class || k2 != id_kind {
+                            return None;
                         }
-                        _ => return None,
                     }
-                }
+                    _ => return None,
+                },
                 Some(HostImport::TableResolver)
                 | Some(HostImport::IndexResolver)
                 | Some(HostImport::DangerousIfReachable) => return None,

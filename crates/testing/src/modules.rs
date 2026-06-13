@@ -155,9 +155,7 @@ impl ModuleHandle {
 
     /// Return a point-in-time snapshot of the batching scheduler statistics for
     /// the module backing this handle. `None` for V8 hosts or exited loops.
-    pub async fn batch_stats(
-        &self,
-    ) -> Option<spacetimedb::host::BatchStatsSnapshot> {
+    pub async fn batch_stats(&self) -> Option<spacetimedb::host::BatchStatsSnapshot> {
         self.client.module().batch_stats().await
     }
 

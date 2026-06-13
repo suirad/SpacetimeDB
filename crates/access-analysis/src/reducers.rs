@@ -30,10 +30,8 @@ pub fn locate(module: &Module, reducer_names: &[&str]) -> Vec<ReducerEntry> {
                 // the wasm symbol keeps the raw identifier; describer exports
                 // still carry the raw names.
                 let raw_candidates = snake_case_candidates(&describers, name);
-                let found: HashSet<FunctionId> = raw_candidates
-                    .iter()
-                    .filter_map(|raw| find_body(module, raw))
-                    .collect();
+                let found: HashSet<FunctionId> =
+                    raw_candidates.iter().filter_map(|raw| find_body(module, raw)).collect();
                 // Accept only an unambiguous single match; multiple distinct
                 // bodies means the mapping is not injective here → wildcard.
                 let mut iter = found.into_iter();
@@ -50,10 +48,7 @@ pub fn locate(module: &Module, reducer_names: &[&str]) -> Vec<ReducerEntry> {
 /// Return the subset of `describers` whose entries are distinct from `name`
 /// AND whose snake-cased form equals `name`. These are the raw Rust identifiers
 /// that schema would have renamed into `name`.
-pub(crate) fn snake_case_candidates<'a>(
-    describers: &'a HashSet<String>,
-    name: &str,
-) -> Vec<&'a str> {
+pub(crate) fn snake_case_candidates<'a>(describers: &'a HashSet<String>, name: &str) -> Vec<&'a str> {
     describers
         .iter()
         .filter(|raw| raw.as_str() != name && raw.to_case(Case::Snake) == name)

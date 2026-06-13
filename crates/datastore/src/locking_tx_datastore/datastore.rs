@@ -1032,20 +1032,16 @@ impl Locking {
         let mut committed_state = self.committed_state.write_arc();
 
         debug_assert!(
-            finished
-                .tx_state
-                .delete_tables
-                .iter()
-                .all(|(table_id, row_ptrs)| {
-                    committed_state
-                        .get_table(*table_id)
-                        .map(|table| {
-                            row_ptrs
-                                .iter()
-                                .all(|ptr| table.get_row_ref(&committed_state.blob_store, ptr).is_some())
-                        })
-                        .unwrap_or(true)
-                }),
+            finished.tx_state.delete_tables.iter().all(|(table_id, row_ptrs)| {
+                committed_state
+                    .get_table(*table_id)
+                    .map(|table| {
+                        row_ptrs
+                            .iter()
+                            .all(|ptr| table.get_row_ref(&committed_state.blob_store, ptr).is_some())
+                    })
+                    .unwrap_or(true)
+            }),
             "batch disjointness violated: a sibling commit invalidated this overlay's delete pointers"
         );
 
@@ -1096,19 +1092,16 @@ impl Locking {
         let mut committed_state = self.committed_state.write_arc();
 
         debug_assert!(
-            tx_state
-                .delete_tables
-                .iter()
-                .all(|(table_id, row_ptrs)| {
-                    committed_state
-                        .get_table(*table_id)
-                        .map(|table| {
-                            row_ptrs
-                                .iter()
-                                .all(|ptr| table.get_row_ref(&committed_state.blob_store, ptr).is_some())
-                        })
-                        .unwrap_or(true)
-                }),
+            tx_state.delete_tables.iter().all(|(table_id, row_ptrs)| {
+                committed_state
+                    .get_table(*table_id)
+                    .map(|table| {
+                        row_ptrs
+                            .iter()
+                            .all(|ptr| table.get_row_ref(&committed_state.blob_store, ptr).is_some())
+                    })
+                    .unwrap_or(true)
+            }),
             "batch disjointness violated: a sibling commit invalidated this overlay's delete pointers"
         );
 

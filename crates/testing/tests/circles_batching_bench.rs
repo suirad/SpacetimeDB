@@ -128,7 +128,11 @@ async fn bench_circles() {
         let fa = module.call_reducer_binary("run_game_circles", &args_circles);
         let fb = module.call_reducer_binary("update_position_with_velocity", &args_vel);
         let (ra, rb) = tokio::join!(fa, fb);
-        assert!(ra.is_ok(), "run_game_circles HETERO round {round} failed: {:?}", ra.err());
+        assert!(
+            ra.is_ok(),
+            "run_game_circles HETERO round {round} failed: {:?}",
+            ra.err()
+        );
         assert!(
             rb.is_ok(),
             "update_position_with_velocity HETERO round {round} failed: {:?}",
@@ -139,8 +143,7 @@ async fn bench_circles() {
     let hetero_mean_ms = hetero_total_ms as f64 / ROUNDS as f64;
     let snap_after_hetero = module.batch_stats().await;
 
-    let (hetero_forks, hetero_batches, hetero_widths) =
-        phase_deltas(&snap_before_hetero, &snap_after_hetero);
+    let (hetero_forks, hetero_batches, hetero_widths) = phase_deltas(&snap_before_hetero, &snap_after_hetero);
     println!(
         "BENCH-CIRCLES phase=hetero cap={} total_ms={} mean_ms={:.1} forks={} batches={} widths={}",
         cap_label, hetero_total_ms, hetero_mean_ms, hetero_forks, hetero_batches, hetero_widths
@@ -159,8 +162,16 @@ async fn bench_circles() {
         let fa = module.call_reducer_binary("run_game_circles", &args_a);
         let fb = module.call_reducer_binary("run_game_circles", &args_b);
         let (ra, rb) = tokio::join!(fa, fb);
-        assert!(ra.is_ok(), "run_game_circles HOMO-A round {round} failed: {:?}", ra.err());
-        assert!(rb.is_ok(), "run_game_circles HOMO-B round {round} failed: {:?}", rb.err());
+        assert!(
+            ra.is_ok(),
+            "run_game_circles HOMO-A round {round} failed: {:?}",
+            ra.err()
+        );
+        assert!(
+            rb.is_ok(),
+            "run_game_circles HOMO-B round {round} failed: {:?}",
+            rb.err()
+        );
     }
     let homo_total_ms = homo_start.elapsed().as_millis();
     let homo_mean_ms = homo_total_ms as f64 / ROUNDS as f64;
@@ -213,8 +224,7 @@ async fn bench_circles() {
     let mixed_mean_ms = mixed_total_ms as f64 / ROUNDS as f64;
     let snap_after_mixed = module.batch_stats().await;
 
-    let (mixed_forks, mixed_batches, mixed_widths) =
-        phase_deltas(&snap_before_mixed, &snap_after_mixed);
+    let (mixed_forks, mixed_batches, mixed_widths) = phase_deltas(&snap_before_mixed, &snap_after_mixed);
     println!(
         "BENCH-CIRCLES phase=mixed cap={} total_ms={} mean_ms={:.1} forks={} batches={} widths={}",
         cap_label, mixed_total_ms, mixed_mean_ms, mixed_forks, mixed_batches, mixed_widths
@@ -410,8 +420,7 @@ async fn bench_circles_learned() {
     let learned_mean_ms = learned_total_ms as f64 / LEARNED_ROUNDS as f64;
     let snap_after_learned = module.batch_stats().await;
 
-    let (learned_forks, learned_batches, learned_widths) =
-        phase_deltas(&snap_before_learned, &snap_after_learned);
+    let (learned_forks, learned_batches, learned_widths) = phase_deltas(&snap_before_learned, &snap_after_learned);
 
     let (learned_promotions, learned_demotions, learned_head_traps, learned_member_traps) =
         match (&snap_before_learned, &snap_after_learned) {
@@ -427,12 +436,7 @@ async fn bench_circles_learned() {
 
     println!(
         "BENCH-CIRCLES phase=learned cap={} total_ms={} mean_ms={:.1} forks={} batches={} widths={}",
-        cap_label,
-        learned_total_ms,
-        learned_mean_ms,
-        learned_forks,
-        learned_batches,
-        learned_widths
+        cap_label, learned_total_ms, learned_mean_ms, learned_forks, learned_batches, learned_widths
     );
     println!(
         "[learned-bench] learned-counters promotions={learned_promotions} \
@@ -569,9 +573,7 @@ async fn bench_three_way() {
 
         let (forks, _batches, widths) = phase_deltas(&snap_before, &snap_after);
         static_mean_ms = mean_ms;
-        println!(
-            "THREEWAY workload=static cap={cap_label} mean_ms={mean_ms:.1} forks={forks} widths={widths}"
-        );
+        println!("THREEWAY workload=static cap={cap_label} mean_ms={mean_ms:.1} forks={forks} widths={widths}");
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -806,9 +808,7 @@ async fn bench_three_way() {
         }
 
         let snap_before_learned = module.batch_stats().await;
-        println!(
-            "[three-way/lost-v2] LEARNED phase start ({LEARNED_ROUNDS} rounds, cap={cap_label})"
-        );
+        println!("[three-way/lost-v2] LEARNED phase start ({LEARNED_ROUNDS} rounds, cap={cap_label})");
         let t_start = std::time::Instant::now();
         for round in 0..LEARNED_ROUNDS {
             let args_circles = product![100_u32];

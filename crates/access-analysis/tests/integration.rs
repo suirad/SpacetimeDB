@@ -168,8 +168,7 @@ fn perf_test_release_wasm_opt() {
     let input_path = tmp_dir.join("perf_test_release_input.wasm");
     let output_path = tmp_dir.join("perf_test_release_opt.wasm");
 
-    std::fs::write(&input_path, &release_bytes)
-        .expect("failed to write release wasm to temp file");
+    std::fs::write(&input_path, &release_bytes).expect("failed to write release wasm to temp file");
 
     let status = std::process::Command::new(&wasm_opt_bin)
         .args(["-all", "-g", "-O2"])
@@ -215,12 +214,7 @@ fn perf_test_release_wasm_opt() {
     // Soundness on the optimized binary: aggressive inlining may over-approximate
     // (sound); under-approximation (a required table missing while not wildcard)
     // must never happen. `assert_sound_superset` enforces this within a universe.
-    assert_sound_superset(
-        &sets["load_location_table"],
-        &[],
-        &["location"],
-        &["location"],
-    );
+    assert_sound_superset(&sets["load_location_table"], &[], &["location"], &["location"]);
 
     for r in [
         "test_index_scan_on_id",

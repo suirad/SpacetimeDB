@@ -436,7 +436,8 @@ impl MutTxId {
     /// Record a reducer write via `index_id`; resolves to parent table.
     /// If the index cannot be resolved the operation itself will fail, so skipping is sound.
     pub fn record_index_write(&mut self, op: &FuncCallType, index_id: IndexId) {
-        if matches!(op, FuncCallType::Reducer) && self.observed.is_some()
+        if matches!(op, FuncCallType::Reducer)
+            && self.observed.is_some()
             && let Some((table_id, _, _)) = self.get_table_and_index(index_id)
         {
             self.record_observed_write_table(table_id);
@@ -3139,13 +3140,7 @@ pub(super) fn update<'a>(
         blob_bytes,
         (tx_table, tx_blob_store, del_table),
         (commit_table, commit_blob_store, _),
-    ) = insert_physically_maybe_generate::<true>(
-        tx_state,
-        committed_state,
-        seq_state,
-        table_id,
-        row,
-    )?;
+    ) = insert_physically_maybe_generate::<true>(tx_state, committed_state, seq_state, table_id, row)?;
 
     let update_flags = UpdateFlags {
         is_scheduler_table: tx_table.is_scheduler(),
@@ -3191,9 +3186,8 @@ pub(super) fn update<'a>(
         });
 
         // Ensure that the new row does not violate other commit table unique constraints.
-        let is_deleted = |commit_ptr| {
-            commit_old_ptr.is_some_and(|old_ptr| old_ptr == commit_ptr) || del_table.contains(commit_ptr)
-        };
+        let is_deleted =
+            |commit_ptr| commit_old_ptr.is_some_and(|old_ptr| old_ptr == commit_ptr) || del_table.contains(commit_ptr);
         // SAFETY: `commit_table.row_layout() == new_row.row_layout()` holds
         // as the `tx_table` is derived from `commit_table`.
         if let Err(e) = unsafe {
@@ -3280,8 +3274,7 @@ pub(super) fn update<'a>(
 
                     // Return the undeleted committed state row.
                     // SAFETY: `commit_table.is_row_present(old_commit_del_ptr)` holds.
-                    let row_ref =
-                        unsafe { commit_table.get_row_ref_unchecked(commit_blob_store, old_commit_del_ptr) };
+                    let row_ref = unsafe { commit_table.get_row_ref_unchecked(commit_blob_store, old_commit_del_ptr) };
                     return ok(RowRefInsertion::Existed(row_ref));
                 }
             }
@@ -3510,7 +3503,11 @@ pub(super) fn table_row_count(tx_state: &TxState, committed_state: &CommittedSta
     }
 }
 
-pub(super) fn iter<'a>(tx_state: &'a TxState, committed_state: &'a CommittedState, table_id: TableId) -> Result<IterMutTx<'a>> {
+pub(super) fn iter<'a>(
+    tx_state: &'a TxState,
+    committed_state: &'a CommittedState,
+    table_id: TableId,
+) -> Result<IterMutTx<'a>> {
     IterMutTx::new(table_id, tx_state, committed_state)
 }
 

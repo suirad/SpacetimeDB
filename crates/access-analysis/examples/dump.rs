@@ -31,11 +31,7 @@ fn main() {
         let writes: Vec<&str> = set.writes.iter().map(|i| &**i).collect();
         println!(
             "  [{:>2}] {:<32} reads={:?} writes={:?} wildcard={}",
-            id.0,
-            &*def.name,
-            reads,
-            writes,
-            set.wildcard,
+            id.0, &*def.name, reads, writes, set.wildcard,
         );
     }
 }

@@ -20,8 +20,8 @@ use spacetimedb_datastore::locking_tx_datastore::state_view::StateView;
 use spacetimedb_datastore::locking_tx_datastore::{
     batch_tx::BatchTxState, FuncCallType, IndexScanPointOrRange, MutTxId, ReducerTxVariant,
 };
-use spacetimedb_datastore::ReducerTx;
 use spacetimedb_datastore::traits::IsolationLevel;
+use spacetimedb_datastore::ReducerTx;
 use spacetimedb_lib::{http as st_http, ConnectionId, Identity, Timestamp};
 use spacetimedb_primitives::{ColId, ColList, IndexId, TableId};
 use spacetimedb_sats::{

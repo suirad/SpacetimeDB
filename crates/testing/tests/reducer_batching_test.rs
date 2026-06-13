@@ -24,8 +24,7 @@ const N: u64 = 5_000;
 const MAX_ROUNDS: usize = 50;
 
 lazy_static! {
-    static ref MODULE: CompiledModule =
-        CompiledModule::compile("reducer-batching-fixture", CompilationMode::Debug);
+    static ref MODULE: CompiledModule = CompiledModule::compile("reducer-batching-fixture", CompilationMode::Debug);
 }
 
 fn init_logger() {
@@ -110,7 +109,8 @@ async fn fork_fires_and_fifo_holds() {
 
         if pool_ready {
             if let Some(snap) = module.batch_stats().await
-                && snap.forks >= 1 && snap.widths[1] >= 1
+                && snap.forks >= 1
+                && snap.widths[1] >= 1
             {
                 forked = true;
                 println!(
@@ -153,18 +153,20 @@ async fn fork_fires_and_fifo_holds() {
         b_count,
         successful_pairs * N,
         "table_b row count mismatch: expected {} ({}×{}), got {}",
-        successful_pairs * N, successful_pairs, N, b_count
+        successful_pairs * N,
+        successful_pairs,
+        N,
+        b_count
     );
     // a_count ≥ pairs × N (warm-up also wrote to a).
     assert!(
         a_count >= successful_pairs * N,
         "table_a row count too low: expected ≥{}, got {}",
-        successful_pairs * N, a_count
+        successful_pairs * N,
+        a_count
     );
 
-    println!(
-        "[fork_fires_and_fifo_holds] PASS — pairs={successful_pairs} a={a_count} b={b_count} forked={forked}"
-    );
+    println!("[fork_fires_and_fifo_holds] PASS — pairs={successful_pairs} a={a_count} b={b_count} forked={forked}");
     if let Some(snap) = module.batch_stats().await {
         println!("[fork_fires_and_fifo_holds] final stats: {snap:?}");
     }
@@ -211,9 +213,7 @@ async fn trap_on_worker_recovers() {
     let _ = trap_rounds;
 
     let snap_mid = module.batch_stats().await;
-    if pool_ready
-        && let Some(s) = &snap_mid
-    {
+    if pool_ready && let Some(s) = &snap_mid {
         println!(
             "[trap_on_worker_recovers] after panic rounds: forks_before={forks_before} forks_now={}",
             s.forks
@@ -358,7 +358,8 @@ async fn learning_promotes_then_batches() {
 
         if pool_ready {
             if let Some(snap) = module.batch_stats().await
-                && snap.forks > forks_before && snap.widths[1] >= 1
+                && snap.forks > forks_before
+                && snap.widths[1] >= 1
             {
                 forked = true;
                 println!(
@@ -399,14 +400,18 @@ async fn learning_promotes_then_batches() {
         b_count,
         successful_pairs * N,
         "table_b count mismatch: expected {}×{}={}, got {}",
-        successful_pairs, N, successful_pairs * N, b_count
+        successful_pairs,
+        N,
+        successful_pairs * N,
+        b_count
     );
     // a has inline runs + pair runs (all via heavy_learn which always writes a).
     let expected_a_min = (inline_runs as u64 + successful_pairs) * N;
     assert!(
         a_count >= expected_a_min,
         "table_a count too low: expected ≥{}, got {}",
-        expected_a_min, a_count
+        expected_a_min,
+        a_count
     );
 
     println!(
@@ -434,7 +439,12 @@ async fn trap_demotes_and_stays_correct() {
     promote_heavy_learn(&module).await;
 
     assert!(
-        module.batch_stats().await.as_ref().map(|s| s.promotions >= 1).unwrap_or(false),
+        module
+            .batch_stats()
+            .await
+            .as_ref()
+            .map(|s| s.promotions >= 1)
+            .unwrap_or(false),
         "must be promoted before trap test"
     );
 
@@ -473,7 +483,11 @@ async fn trap_demotes_and_stays_correct() {
         let fl = module.call_reducer_binary("heavy_learn", &args_l);
         let fb = module.call_reducer_binary("heavy_b", &args_b);
         let (rl, rb) = tokio::join!(fl, fb);
-        assert!(rl.is_ok(), "heavy_learn (flag ON) failed on round {round}: {:?}", rl.err());
+        assert!(
+            rl.is_ok(),
+            "heavy_learn (flag ON) failed on round {round}: {:?}",
+            rl.err()
+        );
         assert!(rb.is_ok(), "heavy_b failed on round {round}: {:?}", rb.err());
         on_flag_pairs += 1;
         b_pairs += 1;
@@ -534,7 +548,10 @@ async fn trap_demotes_and_stays_correct() {
     assert!(
         b_count >= b_pairs * N,
         "table_b must contain at least heavy_b's contribution {}×{}={}, got {}",
-        b_pairs, N, b_pairs * N, b_count
+        b_pairs,
+        N,
+        b_pairs * N,
+        b_count
     );
 
     println!(
@@ -562,7 +579,12 @@ async fn strike_cap_parks() {
     promote_heavy_learn(&module).await;
 
     assert!(
-        module.batch_stats().await.as_ref().map(|s| s.promotions >= 1).unwrap_or(false),
+        module
+            .batch_stats()
+            .await
+            .as_ref()
+            .map(|s| s.promotions >= 1)
+            .unwrap_or(false),
         "must be promoted before park test"
     );
 
@@ -666,10 +688,7 @@ async fn strike_cap_parks() {
             && snap.parks > parks_before_2
         {
             parked = true;
-            println!(
-                "[strike_cap_parks] parked at round {round}: parks={}",
-                snap.parks
-            );
+            println!("[strike_cap_parks] parked at round {round}: parks={}", snap.parks);
             break;
         }
     }

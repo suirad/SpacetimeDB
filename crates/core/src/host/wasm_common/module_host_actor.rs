@@ -629,7 +629,9 @@ impl<T: WasmInstance> WasmModuleInstance<T> {
         params: CallReducerParams,
         capture: CaptureSpec,
     ) -> BatchBodyOutcome {
-        let outcome = self.common.call_reducer_body_batch(tx, params, capture, &mut self.instance);
+        let outcome = self
+            .common
+            .call_reducer_body_batch(tx, params, capture, &mut self.instance);
         self.trapped = outcome.trapped;
         outcome
     }
@@ -1061,7 +1063,9 @@ impl InstanceCommon {
         let _guard = vm_metrics.timer_guard_for_reducer_plus_query(tx.timer);
 
         let (mut tx, result) = tx_slot.set(tx, || {
-            self.call_function(caller_identity, reducer_name, true, |budget| inst.call_reducer(op, budget))
+            self.call_function(caller_identity, reducer_name, true, |budget| {
+                inst.call_reducer(op, budget)
+            })
         });
 
         // Take before view execution: views must not pollute the reducer's observed set.
@@ -1264,7 +1268,9 @@ impl InstanceCommon {
         // Charge-committed-only: batch bodies skip energy recording here; the drain
         // records only for outcomes that actually commit (the host eats speculation losses).
         let (mut tx, result) = tx_slot.set_batch(tx, || {
-            self.call_function(caller_identity, reducer_name, false, |budget| inst.call_reducer(op, budget))
+            self.call_function(caller_identity, reducer_name, false, |budget| {
+                inst.call_reducer(op, budget)
+            })
         });
 
         // Take before the finish/rollback branch so failed bodies still yield their observed set.
@@ -1286,7 +1292,9 @@ impl InstanceCommon {
             Some(tx.finish())
         } else {
             let (tx_metrics, reducer) = tx.rollback();
-            self.info.relational_db().report_mut_tx_metrics(reducer, tx_metrics, None);
+            self.info
+                .relational_db()
+                .report_mut_tx_metrics(reducer, tx_metrics, None);
             None
         };
 
@@ -1392,8 +1400,7 @@ impl InstanceCommon {
             caller_identity,
             function_name: self.info.module_def.reducer_by_id(reducer_id).name.as_ref(),
         };
-        self.energy_monitor
-            .record_reducer(&energy_fingerprint, used, duration);
+        self.energy_monitor.record_reducer(&energy_fingerprint, used, duration);
     }
 
     pub(crate) fn handle_cmd<I: WasmInstance>(&mut self, cmds: ViewCommand, inst: &mut I) -> (ViewCommandResult, bool) {

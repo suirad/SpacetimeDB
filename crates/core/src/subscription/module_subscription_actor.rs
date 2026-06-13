@@ -1812,7 +1812,15 @@ impl ModuleSubscriptions {
             }
         };
         let event = Arc::new(event);
-        self.broadcast_event_inner(subscriptions, subscription_metrics, read_tx, tx_data, tx_metrics_mut, event, caller)
+        self.broadcast_event_inner(
+            subscriptions,
+            subscription_metrics,
+            read_tx,
+            tx_data,
+            tx_metrics_mut,
+            event,
+            caller,
+        )
     }
 
     /// Mirrors [`Self::commit_and_broadcast_event`], using `commit_batch_tx_downgrade` and
@@ -1881,7 +1889,15 @@ impl ModuleSubscriptions {
             }
         };
         let event = Arc::new(event);
-        self.broadcast_event_inner(subscriptions, subscription_metrics, read_tx, tx_data, tx_metrics_mut, event, caller)
+        self.broadcast_event_inner(
+            subscriptions,
+            subscription_metrics,
+            read_tx,
+            tx_data,
+            tx_metrics_mut,
+            event,
+            caller,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4479,7 +4495,10 @@ mod tests {
 
         assert_eq!(inserts_m.len(), 1, "mut path: expected 1 insert");
         assert_eq!(inserts_b.len(), 1, "batch path: expected 1 insert");
-        assert_eq!(inserts_m, inserts_b, "insert row values must match between mut and batch paths");
+        assert_eq!(
+            inserts_m, inserts_b,
+            "insert row values must match between mut and batch paths"
+        );
 
         Ok(())
     }

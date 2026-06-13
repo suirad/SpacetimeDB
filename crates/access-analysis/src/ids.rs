@@ -336,7 +336,10 @@ mod tests {
 
         assert_eq!(
             prov.by_func.get(&ta),
-            Some(&ResolvedName { name: "widget".into(), kind: NameKind::Table }),
+            Some(&ResolvedName {
+                name: "widget".into(),
+                kind: NameKind::Table
+            }),
             "table accessor should resolve to 'widget' through the thin wrapper",
         );
         assert_eq!(
@@ -397,7 +400,10 @@ mod tests {
 
         assert_eq!(
             prov.by_func.get(&acc),
-            Some(&ResolvedName { name: "widget".into(), kind: NameKind::Table }),
+            Some(&ResolvedName {
+                name: "widget".into(),
+                kind: NameKind::Table
+            }),
             "leaf accessor keeps its genuine name",
         );
         assert_eq!(

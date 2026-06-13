@@ -2,18 +2,15 @@ use super::{
     committed_state::CommittedState,
     datastore::{Result, TxMetrics},
     mut_tx::{
-        delete, get_next_sequence_value, insert, update, FuncCallType, IndexScanPoint,
-        MutTxId, ObservedAccess, RowRefInsertion, ViewCallInfo, ViewReadSets,
+        delete, get_next_sequence_value, insert, update, FuncCallType, IndexScanPoint, MutTxId, ObservedAccess,
+        RowRefInsertion, ViewCallInfo, ViewReadSets,
     },
     sequence::SequencesState,
     state_view::{IterByColEqMutTx, IterByColRangeMutTx, IterMutTx, StateView},
     tx_state::TxState,
     SharedReadGuard,
 };
-use crate::{
-    execution_context::ExecutionContext,
-    traits::InsertFlags,
-};
+use crate::{execution_context::ExecutionContext, traits::InsertFlags};
 use core::ops::RangeBounds;
 use parking_lot::Mutex;
 use spacetimedb_lib::metrics::ExecutionMetrics;
@@ -25,7 +22,10 @@ use spacetimedb_table::{
     table::{RowRef, TableAndIndex},
     table_index::IndexKey,
 };
-use std::{sync::Arc, time::{Duration, Instant}};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 /// `BatchTxState` is the transactional state for a single reducer running inside a
 /// concurrent batch. Unlike `MutTxId` it holds a **read** guard (not write) on the
@@ -77,12 +77,23 @@ impl BatchTxState {
         row: &[u8],
     ) -> Result<(ColList, RowRefInsertion<'a>, InsertFlags)> {
         let mut seq = self.sequence_state.lock();
-        insert::<GENERATE>(&mut self.tx_state, &self.committed_state_read_lock, &mut seq, table_id, row)
+        insert::<GENERATE>(
+            &mut self.tx_state,
+            &self.committed_state_read_lock,
+            &mut seq,
+            table_id,
+            row,
+        )
     }
 
     /// Delete a row by its `RowPointer`.
     pub fn delete(&mut self, table_id: TableId, row_pointer: RowPointer) -> Result<bool> {
-        delete(&mut self.tx_state, &self.committed_state_read_lock, table_id, row_pointer)
+        delete(
+            &mut self.tx_state,
+            &self.committed_state_read_lock,
+            table_id,
+            row_pointer,
+        )
     }
 
     /// Clear all rows from `table_id`. Keep in sync with `MutTxId::clear_table`.
@@ -116,14 +127,21 @@ impl BatchTxState {
         row: &[u8],
     ) -> Result<(ColList, RowRefInsertion<'a>, crate::traits::UpdateFlags)> {
         let mut seq = self.sequence_state.lock();
-        update(&mut self.tx_state, &self.committed_state_read_lock, &mut seq, table_id, index_id, row)
+        update(
+            &mut self.tx_state,
+            &self.committed_state_read_lock,
+            &mut seq,
+            table_id,
+            index_id,
+            row,
+        )
     }
 
     /// Get a row by pointer. Keep in sync with `MutTxId::get`.
     pub fn get(&self, table_id: TableId, row_ptr: RowPointer) -> Result<Option<RowRef<'_>>> {
-        use spacetimedb_table::indexes::SquashedOffset;
         use crate::error::TableError;
         use crate::system_tables::SystemTable;
+        use spacetimedb_table::indexes::SquashedOffset;
         if self.table_name(table_id).is_none() {
             return Err(TableError::IdNotFound(SystemTable::st_table, table_id.0).into());
         }
@@ -141,11 +159,7 @@ impl BatchTxState {
     }
 
     /// Delete by matching row value. Keep in sync with `MutTxId::delete_by_row_value`.
-    pub fn delete_by_row_value(
-        &mut self,
-        table_id: TableId,
-        rel: &spacetimedb_sats::ProductValue,
-    ) -> Result<bool> {
+    pub fn delete_by_row_value(&mut self, table_id: TableId, rel: &spacetimedb_sats::ProductValue) -> Result<bool> {
         use spacetimedb_table::table::Table;
         let page_pool = &self.committed_state_read_lock.page_pool;
         let (commit_table, ..) = self.committed_state_read_lock.get_table_and_blob_store(table_id)?;
@@ -164,9 +178,7 @@ impl BatchTxState {
 
         unsafe { tx_table.delete_internal_skip_pointer_map(tx_blob_store, temp_ptr) };
 
-        to_delete
-            .map(|ptr| self.delete(table_id, ptr))
-            .unwrap_or(Ok(false))
+        to_delete.map(|ptr| self.delete(table_id, ptr)).unwrap_or(Ok(false))
     }
 
     // -------------------------------------------------------------------------
@@ -198,9 +210,9 @@ impl BatchTxState {
     where
         'de: 'a,
     {
+        use super::mut_tx::IndexScanPointOrRange;
         use crate::error::IndexError;
         use spacetimedb_table::table_index::PointOrRange;
-        use super::mut_tx::IndexScanPointOrRange;
         let (table_id, commit_index, tx_index) = self
             .get_table_and_index(index_id)
             .ok_or_else(|| IndexError::NotFound(index_id))?;
@@ -287,7 +299,8 @@ impl BatchTxState {
     }
 
     pub fn record_index_write(&mut self, op: &FuncCallType, index_id: IndexId) {
-        if matches!(op, FuncCallType::Reducer) && self.observed.is_some()
+        if matches!(op, FuncCallType::Reducer)
+            && self.observed.is_some()
             && let Some((table_id, _, _)) = self.get_table_and_index(index_id)
         {
             record_observed_write_inner(&mut self.observed, table_id);
@@ -391,7 +404,9 @@ fn record_index_scan_point_inner_batch(
     index_id: IndexId,
     point: IndexKey<'_>,
 ) {
-    let Some((_, idx, _)) = btx.get_table_and_index(index_id) else { return };
+    let Some((_, idx, _)) = btx.get_table_and_index(index_id) else {
+        return;
+    };
     let idx = idx.index();
     let cols = idx.indexed_columns().clone();
     let point_av = idx.key_into_algebraic_value(point);
@@ -661,7 +676,10 @@ mod tests {
 
         // Seed rows to work with (inserted and committed before the test tx).
         // Returns (ds, tid, aux, index_id, seed_row_ids).
-        let seed = |ds: &Locking, tid: spacetimedb_primitives::TableId, aux: spacetimedb_primitives::TableId| -> crate::Result<spacetimedb_primitives::IndexId> {
+        let seed = |ds: &Locking,
+                    tid: spacetimedb_primitives::TableId,
+                    aux: spacetimedb_primitives::TableId|
+         -> crate::Result<spacetimedb_primitives::IndexId> {
             // Insert several rows and two aux rows, commit.
             let mut tx = ds.begin_mut_tx(IsolationLevel::Serializable, workload.clone());
             for v in [10u32, 20, 30] {
@@ -816,7 +834,9 @@ mod tests {
                     .unwrap_or_else(|| format!("table_{}", table_id.0));
                 map.entry(name).or_default().extend(rows.iter().cloned());
             }
-            map.into_iter().map(|(k, v)| (k, sort_pvs(v))).collect::<std::collections::BTreeMap<_, _>>()
+            map.into_iter()
+                .map(|(k, v)| (k, sort_pvs(v)))
+                .collect::<std::collections::BTreeMap<_, _>>()
         };
         let collect_deletes_by_name = |tx_data: &crate::traits::TxData| {
             let mut map: std::collections::BTreeMap<String, Vec<spacetimedb_sats::ProductValue>> =
@@ -828,7 +848,9 @@ mod tests {
                     .unwrap_or_else(|| format!("table_{}", table_id.0));
                 map.entry(name).or_default().extend(rows.iter().cloned());
             }
-            map.into_iter().map(|(k, v)| (k, sort_pvs(v))).collect::<std::collections::BTreeMap<_, _>>()
+            map.into_iter()
+                .map(|(k, v)| (k, sort_pvs(v)))
+                .collect::<std::collections::BTreeMap<_, _>>()
         };
         assert_eq!(
             collect_inserts_by_name(&mut_tx_data),
@@ -875,7 +897,10 @@ mod tests {
             let (_, row_ref, _) = btx.insert::<true>(tid, &zero_row)?;
             let inserted: i64 = row_ref.collapse().read_col(0u16)?;
             if let Some(prev) = last_val {
-                assert!(inserted > prev, "sequence values must be strictly increasing: {prev} -> {inserted}");
+                assert!(
+                    inserted > prev,
+                    "sequence values must be strictly increasing: {prev} -> {inserted}"
+                );
             }
             last_val = Some(inserted);
             let finished = btx.finish();
@@ -1081,13 +1106,19 @@ mod tests {
         // Batch tx inserting col0=5 (key hit) → true.
         let mut btx_hit = ds.begin_batch_tx(workload.clone());
         btx_hit.insert::<false>(tid, &spacetimedb_sats::bsatn::to_vec(&product![5i64, 1u32]).unwrap())?;
-        assert!(btx_hit.view_refresh_nonempty(), "insert hitting key K should return true");
+        assert!(
+            btx_hit.view_refresh_nonempty(),
+            "insert hitting key K should return true"
+        );
         drop(btx_hit);
 
         // Batch tx inserting col0=99 (key miss) → false.
         let mut btx_miss = ds.begin_batch_tx(workload.clone());
         btx_miss.insert::<false>(tid, &spacetimedb_sats::bsatn::to_vec(&product![99i64, 1u32]).unwrap())?;
-        assert!(!btx_miss.view_refresh_nonempty(), "insert missing key K' should return false");
+        assert!(
+            !btx_miss.view_refresh_nonempty(),
+            "insert missing key K' should return false"
+        );
         drop(btx_miss);
 
         Ok(())
@@ -1177,13 +1208,22 @@ mod tests {
         // Insert into watched → true.
         let mut btx_watched = ds.begin_batch_tx(workload.clone());
         btx_watched.insert::<true>(tid_watched, &spacetimedb_sats::bsatn::to_vec(&product![1u32]).unwrap())?;
-        assert!(btx_watched.view_refresh_nonempty(), "insert into full-scan table should return true");
+        assert!(
+            btx_watched.view_refresh_nonempty(),
+            "insert into full-scan table should return true"
+        );
         drop(btx_watched);
 
         // Insert into unwatched → false.
         let mut btx_unwatched = ds.begin_batch_tx(workload.clone());
-        btx_unwatched.insert::<true>(tid_unwatched, &spacetimedb_sats::bsatn::to_vec(&product![2u32]).unwrap())?;
-        assert!(!btx_unwatched.view_refresh_nonempty(), "insert into untracked table should return false");
+        btx_unwatched.insert::<true>(
+            tid_unwatched,
+            &spacetimedb_sats::bsatn::to_vec(&product![2u32]).unwrap(),
+        )?;
+        assert!(
+            !btx_unwatched.view_refresh_nonempty(),
+            "insert into untracked table should return false"
+        );
         drop(btx_unwatched);
 
         Ok(())
@@ -1224,7 +1264,10 @@ mod tests {
 
         // Seed a committed row in key_tbl with col0=10 for the delete-side test.
         let mut seed = ds.begin_mut_tx(IsolationLevel::Serializable, workload.clone());
-        seed.insert::<false>(tid_key, &spacetimedb_sats::bsatn::to_vec(&product![10i64, 0u32]).unwrap())?;
+        seed.insert::<false>(
+            tid_key,
+            &spacetimedb_sats::bsatn::to_vec(&product![10i64, 0u32]).unwrap(),
+        )?;
         ds.commit_mut_tx(seed)?;
 
         // Get the committed row pointer for col0=10 in key_tbl.
@@ -1237,11 +1280,20 @@ mod tests {
         // For insert_key_hit patterns we'll use a different non-conflicting value (col0=20).
         let view_scan_id = ViewId(60);
         let view_key_id = ViewId(61);
-        let view_op_scan = FuncCallType::View(ViewCallInfo { view_id: view_scan_id, sender: None });
-        let view_op_key = FuncCallType::View(ViewCallInfo { view_id: view_key_id, sender: None });
+        let view_op_scan = FuncCallType::View(ViewCallInfo {
+            view_id: view_scan_id,
+            sender: None,
+        });
+        let view_op_key = FuncCallType::View(ViewCallInfo {
+            view_id: view_key_id,
+            sender: None,
+        });
         // Also register key=20 (not in committed state, so insertions won't conflict).
         let view_key2_id = ViewId(62);
-        let view_op_key2 = FuncCallType::View(ViewCallInfo { view_id: view_key2_id, sender: None });
+        let view_op_key2 = FuncCallType::View(ViewCallInfo {
+            view_id: view_key2_id,
+            sender: None,
+        });
         let key10_bsatn = spacetimedb_sats::bsatn::to_vec(&10i64).unwrap();
         let key20_bsatn = spacetimedb_sats::bsatn::to_vec(&20i64).unwrap();
         let mut view_tx = ds.begin_mut_tx(IsolationLevel::Serializable, workload.clone());
@@ -1260,26 +1312,40 @@ mod tests {
         // Pattern: insert hitting key K=20 (registered view key, not in committed state)
         {
             let mut mtx = ds.begin_mut_tx(IsolationLevel::Serializable, workload.clone());
-            mtx.insert::<false>(tid_key, &spacetimedb_sats::bsatn::to_vec(&product![20i64, 1u32]).unwrap())?;
+            mtx.insert::<false>(
+                tid_key,
+                &spacetimedb_sats::bsatn::to_vec(&product![20i64, 1u32]).unwrap(),
+            )?;
             let mut_result = mtx.views_for_refresh().next().is_some();
             let _ = ds.rollback_mut_tx(mtx);
             let mut btx = ds.begin_batch_tx(workload.clone());
-            btx.insert::<false>(tid_key, &spacetimedb_sats::bsatn::to_vec(&product![20i64, 1u32]).unwrap())?;
+            btx.insert::<false>(
+                tid_key,
+                &spacetimedb_sats::bsatn::to_vec(&product![20i64, 1u32]).unwrap(),
+            )?;
             let batch_result = btx.view_refresh_nonempty();
             drop(btx);
-            assert_eq!(mut_result, batch_result,
+            assert_eq!(
+                mut_result, batch_result,
                 "pattern 'insert_key_hit': mut={} batch={} — batch=false,mut=true is under-detection (data corruption)",
-                mut_result, batch_result);
+                mut_result, batch_result
+            );
         }
 
         // Pattern: insert missing key K'=99 (not a registered view key)
         {
             let mut mtx = ds.begin_mut_tx(IsolationLevel::Serializable, workload.clone());
-            mtx.insert::<false>(tid_key, &spacetimedb_sats::bsatn::to_vec(&product![99i64, 1u32]).unwrap())?;
+            mtx.insert::<false>(
+                tid_key,
+                &spacetimedb_sats::bsatn::to_vec(&product![99i64, 1u32]).unwrap(),
+            )?;
             let mut_result = mtx.views_for_refresh().next().is_some();
             let _ = ds.rollback_mut_tx(mtx);
             let mut btx = ds.begin_batch_tx(workload.clone());
-            btx.insert::<false>(tid_key, &spacetimedb_sats::bsatn::to_vec(&product![99i64, 1u32]).unwrap())?;
+            btx.insert::<false>(
+                tid_key,
+                &spacetimedb_sats::bsatn::to_vec(&product![99i64, 1u32]).unwrap(),
+            )?;
             let batch_result = btx.view_refresh_nonempty();
             drop(btx);
             assert_eq!(mut_result, batch_result,
@@ -1297,15 +1363,20 @@ mod tests {
             btx.delete(tid_key, key_row_ptr)?;
             let batch_result = btx.view_refresh_nonempty();
             drop(btx);
-            assert_eq!(mut_result, batch_result,
+            assert_eq!(
+                mut_result, batch_result,
                 "pattern 'delete_key_hit': mut={} batch={} — batch=false,mut=true is under-detection (data corruption)",
-                mut_result, batch_result);
+                mut_result, batch_result
+            );
         }
 
         // Pattern: delete missing key (row col0=11, not a registered view key)
         {
             let mut seed11 = ds.begin_mut_tx(IsolationLevel::Serializable, workload.clone());
-            seed11.insert::<false>(tid_key, &spacetimedb_sats::bsatn::to_vec(&product![11i64, 0u32]).unwrap())?;
+            seed11.insert::<false>(
+                tid_key,
+                &spacetimedb_sats::bsatn::to_vec(&product![11i64, 0u32]).unwrap(),
+            )?;
             ds.commit_mut_tx(seed11)?;
             let rtx11 = ds.begin_mut_tx(IsolationLevel::Serializable, workload.clone());
             let ptr11 = rtx11
@@ -1347,11 +1418,17 @@ mod tests {
         // Pattern: insert into untracked table only
         {
             let mut mtx = ds.begin_mut_tx(IsolationLevel::Serializable, workload.clone());
-            mtx.insert::<true>(tid_untracked, &spacetimedb_sats::bsatn::to_vec(&product![5u32]).unwrap())?;
+            mtx.insert::<true>(
+                tid_untracked,
+                &spacetimedb_sats::bsatn::to_vec(&product![5u32]).unwrap(),
+            )?;
             let mut_result = mtx.views_for_refresh().next().is_some();
             let _ = ds.rollback_mut_tx(mtx);
             let mut btx = ds.begin_batch_tx(workload.clone());
-            btx.insert::<true>(tid_untracked, &spacetimedb_sats::bsatn::to_vec(&product![5u32]).unwrap())?;
+            btx.insert::<true>(
+                tid_untracked,
+                &spacetimedb_sats::bsatn::to_vec(&product![5u32]).unwrap(),
+            )?;
             let batch_result = btx.view_refresh_nonempty();
             drop(btx);
             assert_eq!(mut_result, batch_result,
@@ -1363,17 +1440,25 @@ mod tests {
         {
             let mut mtx = ds.begin_mut_tx(IsolationLevel::Serializable, workload.clone());
             mtx.insert::<true>(tid_scan, &spacetimedb_sats::bsatn::to_vec(&product![1u32]).unwrap())?;
-            mtx.insert::<false>(tid_key, &spacetimedb_sats::bsatn::to_vec(&product![99i64, 2u32]).unwrap())?;
+            mtx.insert::<false>(
+                tid_key,
+                &spacetimedb_sats::bsatn::to_vec(&product![99i64, 2u32]).unwrap(),
+            )?;
             let mut_result = mtx.views_for_refresh().next().is_some();
             let _ = ds.rollback_mut_tx(mtx);
             let mut btx = ds.begin_batch_tx(workload.clone());
             btx.insert::<true>(tid_scan, &spacetimedb_sats::bsatn::to_vec(&product![1u32]).unwrap())?;
-            btx.insert::<false>(tid_key, &spacetimedb_sats::bsatn::to_vec(&product![99i64, 2u32]).unwrap())?;
+            btx.insert::<false>(
+                tid_key,
+                &spacetimedb_sats::bsatn::to_vec(&product![99i64, 2u32]).unwrap(),
+            )?;
             let batch_result = btx.view_refresh_nonempty();
             drop(btx);
-            assert_eq!(mut_result, batch_result,
+            assert_eq!(
+                mut_result, batch_result,
                 "pattern 'mixed_scan_tbl': mut={} batch={} — batch=false,mut=true is under-detection (data corruption)",
-                mut_result, batch_result);
+                mut_result, batch_result
+            );
         }
 
         // Pattern: empty tx (no writes)
@@ -1384,9 +1469,11 @@ mod tests {
             let btx = ds.begin_batch_tx(workload.clone());
             let batch_result = btx.view_refresh_nonempty();
             drop(btx);
-            assert_eq!(mut_result, batch_result,
+            assert_eq!(
+                mut_result, batch_result,
                 "pattern 'empty_tx': mut={} batch={} — batch=false,mut=true is under-detection (data corruption)",
-                mut_result, batch_result);
+                mut_result, batch_result
+            );
         }
 
         Ok(())
@@ -1433,8 +1520,14 @@ mod tests {
         // Register: full-scan on A; index key 3 on B; nothing on C.
         let view_a_id = ViewId(70);
         let view_b_id = ViewId(71);
-        let view_op_a = FuncCallType::View(ViewCallInfo { view_id: view_a_id, sender: None });
-        let view_op_b = FuncCallType::View(ViewCallInfo { view_id: view_b_id, sender: None });
+        let view_op_a = FuncCallType::View(ViewCallInfo {
+            view_id: view_a_id,
+            sender: None,
+        });
+        let view_op_b = FuncCallType::View(ViewCallInfo {
+            view_id: view_b_id,
+            sender: None,
+        });
         let key_bsatn = spacetimedb_sats::bsatn::to_vec(&3i64).unwrap();
         let mut view_tx = ds.begin_mut_tx(IsolationLevel::Serializable, workload.clone());
         view_tx.record_table_scan(&view_op_a, tid_a);
@@ -1446,12 +1539,36 @@ mod tests {
         // Use a BatchTxState's read guard (via view_overlap_kind passthrough) to drive checks.
         let btx = ds.begin_batch_tx(workload.clone());
 
-        assert_eq!(btx.view_overlap_kind([tid_c].into_iter()), ViewOverlapKind::None, "[C] → None");
-        assert_eq!(btx.view_overlap_kind([tid_b].into_iter()), ViewOverlapKind::KeyOnly, "[B] → KeyOnly");
-        assert_eq!(btx.view_overlap_kind([tid_a].into_iter()), ViewOverlapKind::FullScan, "[A] → FullScan");
-        assert_eq!(btx.view_overlap_kind([tid_a, tid_b].into_iter()), ViewOverlapKind::FullScan, "[A,B] → FullScan");
-        assert_eq!(btx.view_overlap_kind([tid_b, tid_c].into_iter()), ViewOverlapKind::KeyOnly, "[B,C] → KeyOnly");
-        assert_eq!(btx.view_overlap_kind([].into_iter()), ViewOverlapKind::None, "empty → None");
+        assert_eq!(
+            btx.view_overlap_kind([tid_c].into_iter()),
+            ViewOverlapKind::None,
+            "[C] → None"
+        );
+        assert_eq!(
+            btx.view_overlap_kind([tid_b].into_iter()),
+            ViewOverlapKind::KeyOnly,
+            "[B] → KeyOnly"
+        );
+        assert_eq!(
+            btx.view_overlap_kind([tid_a].into_iter()),
+            ViewOverlapKind::FullScan,
+            "[A] → FullScan"
+        );
+        assert_eq!(
+            btx.view_overlap_kind([tid_a, tid_b].into_iter()),
+            ViewOverlapKind::FullScan,
+            "[A,B] → FullScan"
+        );
+        assert_eq!(
+            btx.view_overlap_kind([tid_b, tid_c].into_iter()),
+            ViewOverlapKind::KeyOnly,
+            "[B,C] → KeyOnly"
+        );
+        assert_eq!(
+            btx.view_overlap_kind([].into_iter()),
+            ViewOverlapKind::None,
+            "empty → None"
+        );
 
         drop(btx);
         Ok(())
@@ -1484,8 +1601,7 @@ mod tests {
 
         // commit_batch_tx_downgrade_and_then contains the admission debug_assert;
         // if it fires the test panics.
-        let (_tx_data, _metrics, read_tx) =
-            ds.commit_batch_tx_downgrade_and_then(finished, workload, |_| {});
+        let (_tx_data, _metrics, read_tx) = ds.commit_batch_tx_downgrade_and_then(finished, workload, |_| {});
 
         let count = read_tx.iter(tid)?.count();
         assert_eq!(count, 1, "committed row must be visible via returned read tx");

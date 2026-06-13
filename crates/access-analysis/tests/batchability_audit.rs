@@ -136,7 +136,12 @@ fn audit_module(name: &str, debug: bool) {
 #[test]
 #[ignore]
 fn batchability_audit() {
-    let modules = ["benchmarks", "keynote-benchmarks", "perf-test", "reducer-batching-fixture"];
+    let modules = [
+        "benchmarks",
+        "keynote-benchmarks",
+        "perf-test",
+        "reducer-batching-fixture",
+    ];
 
     for name in &modules {
         for debug in [true, false] {

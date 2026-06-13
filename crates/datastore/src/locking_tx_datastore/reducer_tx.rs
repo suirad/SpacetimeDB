@@ -1,12 +1,10 @@
 use super::{
     batch_tx::BatchTxState,
     mut_tx::{
-        FuncCallType, IndexScanPoint, IndexScanPointOrRange, MutTxId,
-        ObservedAccess, RowRefInsertion, ViewCallInfo,
+        FuncCallType, IndexScanPoint, IndexScanPointOrRange, MutTxId, ObservedAccess, RowRefInsertion, ViewCallInfo,
     },
     state_view::{IterByColEqMutTx, IterByColRangeMutTx, IterMutTx, StateView},
 };
-use spacetimedb_table::table_index::IndexKey;
 use crate::{
     execution_context::ExecutionContext,
     locking_tx_datastore::datastore::Result,
@@ -17,6 +15,7 @@ use spacetimedb_lib::metrics::ExecutionMetrics;
 use spacetimedb_primitives::{ColList, IndexId, SequenceId, TableId};
 use spacetimedb_sats::{AlgebraicValue, ProductValue};
 use spacetimedb_schema::schema::TableSchema;
+use spacetimedb_table::table_index::IndexKey;
 use spacetimedb_table::{indexes::RowPointer, table::RowRef};
 use std::sync::Arc;
 
@@ -91,13 +90,7 @@ pub trait ReducerTx: StateView {
         index_id: IndexId,
         point: Option<IndexKey<'_>>,
     );
-    fn record_index_scan_point(
-        &mut self,
-        op: &FuncCallType,
-        table_id: TableId,
-        index_id: IndexId,
-        point: IndexKey<'_>,
-    );
+    fn record_index_scan_point(&mut self, op: &FuncCallType, table_id: TableId, index_id: IndexId, point: IndexKey<'_>);
     fn record_table_write(&mut self, op: &FuncCallType, table_id: TableId);
     fn record_index_write(&mut self, op: &FuncCallType, index_id: IndexId);
     fn enable_access_capture(&mut self);
@@ -110,8 +103,12 @@ pub trait ReducerTx: StateView {
 // -------------------------------------------------------------------------
 
 impl ReducerTx for MutTxId {
-    fn ctx(&self) -> &ExecutionContext { &self.ctx }
-    fn metrics_mut(&mut self) -> &mut ExecutionMetrics { &mut self.metrics }
+    fn ctx(&self) -> &ExecutionContext {
+        &self.ctx
+    }
+    fn metrics_mut(&mut self) -> &mut ExecutionMetrics {
+        &mut self.metrics
+    }
 
     fn row_type_for_table(&self, table_id: TableId) -> Result<RowTypeForTable<'_>> {
         self.row_type_for_table(table_id)
@@ -227,11 +224,19 @@ impl ReducerTx for MutTxId {
 // -------------------------------------------------------------------------
 
 impl ReducerTx for BatchTxState {
-    fn ctx(&self) -> &ExecutionContext { &self.ctx }
-    fn metrics_mut(&mut self) -> &mut ExecutionMetrics { &mut self.metrics }
+    fn ctx(&self) -> &ExecutionContext {
+        &self.ctx
+    }
+    fn metrics_mut(&mut self) -> &mut ExecutionMetrics {
+        &mut self.metrics
+    }
 
     fn row_type_for_table(&self, table_id: TableId) -> Result<RowTypeForTable<'_>> {
-        if let Some(row_type) = self.committed_state_read_lock.get_table(table_id).map(|t| t.get_row_type()) {
+        if let Some(row_type) = self
+            .committed_state_read_lock
+            .get_table(table_id)
+            .map(|t| t.get_row_type())
+        {
             return Ok(RowTypeForTable::Ref(row_type));
         }
         Ok(RowTypeForTable::Arc(StateView::schema_for_table(self, table_id)?))
@@ -248,7 +253,9 @@ impl ReducerTx for BatchTxState {
     fn view_id_from_name(&self, name: &str) -> Result<Option<spacetimedb_primitives::ViewId>> {
         use crate::system_tables::{StViewFields, ST_VIEW_ID};
         let view_name = &name.into();
-        let row = self.iter_by_col_eq(ST_VIEW_ID, StViewFields::ViewName, view_name)?.next();
+        let row = self
+            .iter_by_col_eq(ST_VIEW_ID, StViewFields::ViewName, view_name)?
+            .next();
         Ok(row.map(|row| row.read_col(StViewFields::ViewId).unwrap()))
     }
     fn get(&self, table_id: TableId, row_ptr: RowPointer) -> Result<Option<RowRef<'_>>> {

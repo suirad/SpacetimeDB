@@ -92,7 +92,10 @@ async fn pool_off_no_spawn_no_forks_all_commit() {
         "pool should remain Off with STDB_REDUCER_POOL_CAP=0"
     );
     assert_eq!(snap.forks, 0, "no forks should occur with pool Off");
-    assert!(snap.calibrated_ns.is_none(), "no calibration should happen with pool Off");
+    assert!(
+        snap.calibrated_ns.is_none(),
+        "no calibration should happen with pool Off"
+    );
 
     // DB consistency.
     module

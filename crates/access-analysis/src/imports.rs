@@ -25,7 +25,10 @@ pub enum IdKind {
 /// Classification of a single imported host function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostImport {
-    TableOp { class: OpClass, id_kind: IdKind },
+    TableOp {
+        class: OpClass,
+        id_kind: IdKind,
+    },
     TableResolver,
     IndexResolver,
     /// A recognized host op that does not, on its own, touch any table.
@@ -72,22 +75,58 @@ fn classify_name(name: &str) -> Option<HostImport> {
     use IdKind::*;
     use OpClass::*;
     Some(match name {
-        "datastore_insert_bsatn" => HostImport::TableOp { class: Write, id_kind: Table },
+        "datastore_insert_bsatn" => HostImport::TableOp {
+            class: Write,
+            id_kind: Table,
+        },
         // arg0 is the table_id (arg1 is an index_id); key on the table it writes.
-        "datastore_update_bsatn" => HostImport::TableOp { class: Write, id_kind: Table },
-        "datastore_delete_all_by_eq_bsatn" => HostImport::TableOp { class: Write, id_kind: Table },
-        "datastore_clear" => HostImport::TableOp { class: Write, id_kind: Table },
-        "datastore_table_scan_bsatn" => HostImport::TableOp { class: Read, id_kind: Table },
-        "datastore_table_row_count" => HostImport::TableOp { class: Read, id_kind: Table },
+        "datastore_update_bsatn" => HostImport::TableOp {
+            class: Write,
+            id_kind: Table,
+        },
+        "datastore_delete_all_by_eq_bsatn" => HostImport::TableOp {
+            class: Write,
+            id_kind: Table,
+        },
+        "datastore_clear" => HostImport::TableOp {
+            class: Write,
+            id_kind: Table,
+        },
+        "datastore_table_scan_bsatn" => HostImport::TableOp {
+            class: Read,
+            id_kind: Table,
+        },
+        "datastore_table_row_count" => HostImport::TableOp {
+            class: Read,
+            id_kind: Table,
+        },
 
-        "datastore_index_scan_point_bsatn" => HostImport::TableOp { class: Read, id_kind: Index },
-        "datastore_index_scan_range_bsatn" => HostImport::TableOp { class: Read, id_kind: Index },
+        "datastore_index_scan_point_bsatn" => HostImport::TableOp {
+            class: Read,
+            id_kind: Index,
+        },
+        "datastore_index_scan_range_bsatn" => HostImport::TableOp {
+            class: Read,
+            id_kind: Index,
+        },
         // Deprecated alias of the range scan.
-        "datastore_btree_scan_bsatn" => HostImport::TableOp { class: Read, id_kind: Index },
-        "datastore_delete_by_index_scan_point_bsatn" => HostImport::TableOp { class: Write, id_kind: Index },
-        "datastore_delete_by_index_scan_range_bsatn" => HostImport::TableOp { class: Write, id_kind: Index },
+        "datastore_btree_scan_bsatn" => HostImport::TableOp {
+            class: Read,
+            id_kind: Index,
+        },
+        "datastore_delete_by_index_scan_point_bsatn" => HostImport::TableOp {
+            class: Write,
+            id_kind: Index,
+        },
+        "datastore_delete_by_index_scan_range_bsatn" => HostImport::TableOp {
+            class: Write,
+            id_kind: Index,
+        },
         // Deprecated alias of the range delete.
-        "datastore_delete_by_btree_scan_bsatn" => HostImport::TableOp { class: Write, id_kind: Index },
+        "datastore_delete_by_btree_scan_bsatn" => HostImport::TableOp {
+            class: Write,
+            id_kind: Index,
+        },
 
         "table_id_from_name" => HostImport::TableResolver,
         "index_id_from_name" => HostImport::IndexResolver,
@@ -176,11 +215,17 @@ mod tests {
 
         assert!(matches!(
             classify_kind("datastore_insert_bsatn", &table, &module),
-            Some(HostImport::TableOp { class: OpClass::Write, id_kind: IdKind::Table })
+            Some(HostImport::TableOp {
+                class: OpClass::Write,
+                id_kind: IdKind::Table
+            })
         ));
         assert!(matches!(
             classify_kind("datastore_index_scan_point_bsatn", &table, &module),
-            Some(HostImport::TableOp { class: OpClass::Read, id_kind: IdKind::Index })
+            Some(HostImport::TableOp {
+                class: OpClass::Read,
+                id_kind: IdKind::Index
+            })
         ));
         assert!(matches!(
             classify_kind("table_id_from_name", &table, &module),

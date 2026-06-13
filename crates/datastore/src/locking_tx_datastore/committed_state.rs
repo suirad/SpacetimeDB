@@ -121,7 +121,11 @@ impl CommittedState {
                 has_key = true;
             }
         }
-        if has_key { ViewOverlapKind::KeyOnly } else { ViewOverlapKind::None }
+        if has_key {
+            ViewOverlapKind::KeyOnly
+        } else {
+            ViewOverlapKind::None
+        }
     }
 
     /// Returns the views that perform a full scan of this table

@@ -32,8 +32,7 @@ const WARM_MAX: usize = 30;
 const ROUNDS: usize = 20;
 
 lazy_static! {
-    static ref MODULE: CompiledModule =
-        CompiledModule::compile("benchmarks-cs", CompilationMode::Release);
+    static ref MODULE: CompiledModule = CompiledModule::compile("benchmarks-cs", CompilationMode::Release);
 }
 
 /// Base (cap=0) vs v2 (cap=1, learned) measurement of `run_game_circles ‖ run_game_ia_loop`
@@ -188,9 +187,7 @@ async fn bench_csharp_base_v2() {
     let solo_circles_ms = solo_time(&module, "run_game_circles", CIRCLES_LOAD).await;
     let solo_ia_ms = solo_time(&module, "run_game_ia_loop", IA_INITIAL_LOAD).await;
     let solo_upv_ms = solo_time(&module, "update_position_with_velocity", 0).await;
-    println!(
-        "CSBENCH-SOLO cap={cap_label} circles_ms={solo_circles_ms} ia_loop_ms={solo_ia_ms} upv_ms={solo_upv_ms}"
-    );
+    println!("CSBENCH-SOLO cap={cap_label} circles_ms={solo_circles_ms} ia_loop_ms={solo_ia_ms} upv_ms={solo_upv_ms}");
 
     // Imbalanced pair (circles ≫ ia_loop) — forks but little wall gain.
     measure_pair(
@@ -262,13 +259,7 @@ async fn solo_time(module: &ModuleHandle, name: &str, arg: u32) -> u128 {
 
 /// Run `ROUNDS` concurrent rounds of `a ‖ b` and print a `CSBENCH workload={label}` line
 /// with mean ms/round and the fork/width deltas across the phase.
-async fn measure_pair(
-    module: &ModuleHandle,
-    cap_label: &str,
-    label: &str,
-    a: (&str, u32),
-    b: (&str, u32),
-) {
+async fn measure_pair(module: &ModuleHandle, cap_label: &str, label: &str, a: (&str, u32), b: (&str, u32)) {
     let before = module.batch_stats().await;
     let args_a = product![a.1];
     let args_b = product![b.1];

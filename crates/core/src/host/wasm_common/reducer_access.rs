@@ -41,8 +41,16 @@ pub(crate) struct ResolvedAccess {
 
 impl ResolvedAccess {
     #[cfg(test)]
-    pub(crate) fn for_test(read_tables: Vec<Vec<TableId>>, write_tables: Vec<Vec<TableId>>, wildcard: Vec<bool>) -> Self {
-        Self { read_tables, write_tables, wildcard }
+    pub(crate) fn for_test(
+        read_tables: Vec<Vec<TableId>>,
+        write_tables: Vec<Vec<TableId>>,
+        wildcard: Vec<bool>,
+    ) -> Self {
+        Self {
+            read_tables,
+            write_tables,
+            wildcard,
+        }
     }
 }
 
@@ -188,7 +196,10 @@ mod tests {
         let info = ReducerAccessInfo::new(b"garbage wasm bytes that will fail to parse", &module_def);
 
         assert_eq!(info.sets.len(), 2);
-        assert!(info.sets.iter().all(|s| s.wildcard), "expected all wildcard on parse failure");
+        assert!(
+            info.sets.iter().all(|s| s.wildcard),
+            "expected all wildcard on parse failure"
+        );
 
         // Wildcard reducers conflict with everything, including themselves.
         for i in 0..2 {

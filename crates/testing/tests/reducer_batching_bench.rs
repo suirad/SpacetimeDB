@@ -26,8 +26,7 @@ const M_MIXED: usize = 40;
 const CHEAP_CALLS: usize = 2000;
 
 lazy_static! {
-    static ref MODULE: CompiledModule =
-        CompiledModule::compile("reducer-batching-fixture", CompilationMode::Debug);
+    static ref MODULE: CompiledModule = CompiledModule::compile("reducer-batching-fixture", CompilationMode::Debug);
 }
 
 /// Parse all seven counts from the most recent `counts a=X b=Y c=Z …` log line.
@@ -152,7 +151,11 @@ async fn bench() {
         ];
         let results = join_all(futures).await;
         for (idx, r) in results.iter().enumerate() {
-            assert!(r.is_ok(), "mixed round {round} call[{idx}] failed: {:?}", r.as_ref().err());
+            assert!(
+                r.is_ok(),
+                "mixed round {round} call[{idx}] failed: {:?}",
+                r.as_ref().err()
+            );
         }
     }
     let mixed_total_ms = mixed_start.elapsed().as_millis();
@@ -166,32 +169,27 @@ async fn bench() {
     println!("[bench] mixed batch_stats snapshot: {snap_after_mixed:?}");
 
     // Per-phase deltas relative to the snapshot taken before this phase.
-    let (mixed_forks_delta, mixed_batches_delta, mixed_widths_delta_str) =
-        match (&snap_before_mixed, &snap_after_mixed) {
-            (Some(before), Some(after)) => {
-                let forks_d = after.forks.saturating_sub(before.forks);
-                let batches_d = after.batches.saturating_sub(before.batches);
-                // Element-wise delta for the widths histogram.
-                let widths_d: Vec<u64> = after
-                    .widths
-                    .iter()
-                    .zip(before.widths.iter())
-                    .map(|(a, b)| a.saturating_sub(*b))
-                    .collect();
-                (forks_d, batches_d, format!("{widths_d:?}"))
-            }
-            (None, Some(after)) => (after.forks, after.batches, format!("{:?}", after.widths)),
-            _ => (0, 0, "N/A".to_string()),
-        };
+    let (mixed_forks_delta, mixed_batches_delta, mixed_widths_delta_str) = match (&snap_before_mixed, &snap_after_mixed)
+    {
+        (Some(before), Some(after)) => {
+            let forks_d = after.forks.saturating_sub(before.forks);
+            let batches_d = after.batches.saturating_sub(before.batches);
+            // Element-wise delta for the widths histogram.
+            let widths_d: Vec<u64> = after
+                .widths
+                .iter()
+                .zip(before.widths.iter())
+                .map(|(a, b)| a.saturating_sub(*b))
+                .collect();
+            (forks_d, batches_d, format!("{widths_d:?}"))
+        }
+        (None, Some(after)) => (after.forks, after.batches, format!("{:?}", after.widths)),
+        _ => (0, 0, "N/A".to_string()),
+    };
 
     println!(
         "BENCH-MIXED cap={} mixed_total_ms={} mixed_mean_ms={:.1} forks={} batches={} widths={}",
-        cap_label,
-        mixed_total_ms,
-        mixed_mean_ms,
-        mixed_forks_delta,
-        mixed_batches_delta,
-        mixed_widths_delta_str,
+        cap_label, mixed_total_ms, mixed_mean_ms, mixed_forks_delta, mixed_batches_delta, mixed_widths_delta_str,
     );
 
     // ── Cheap phase ──────────────────────────────────────────────────────────
@@ -216,11 +214,7 @@ async fn bench() {
     println!("[bench] final batch_stats: {snap:?}");
 
     let (forks, batches, widths_str) = match &snap {
-        Some(s) => (
-            s.forks,
-            s.batches,
-            format!("{:?}", s.widths),
-        ),
+        Some(s) => (s.forks, s.batches, format!("{:?}", s.widths)),
         None => (0, 0, "N/A".to_string()),
     };
 
@@ -248,11 +242,41 @@ async fn bench() {
         parse_counts(&log).expect("log_counts output not found in log");
 
     // c–g are only written by the mixed phase (2 calls per table per round).
-    assert_eq!(c_count, 2 * M_MIXED as u64, "table_c: expected {} got {}", 2 * M_MIXED, c_count);
-    assert_eq!(d_count, 2 * M_MIXED as u64, "table_d: expected {} got {}", 2 * M_MIXED, d_count);
-    assert_eq!(e_count, 2 * M_MIXED as u64, "table_e: expected {} got {}", 2 * M_MIXED, e_count);
-    assert_eq!(f_count, 2 * M_MIXED as u64, "table_f: expected {} got {}", 2 * M_MIXED, f_count);
-    assert_eq!(g_count, 2 * M_MIXED as u64, "table_g: expected {} got {}", 2 * M_MIXED, g_count);
+    assert_eq!(
+        c_count,
+        2 * M_MIXED as u64,
+        "table_c: expected {} got {}",
+        2 * M_MIXED,
+        c_count
+    );
+    assert_eq!(
+        d_count,
+        2 * M_MIXED as u64,
+        "table_d: expected {} got {}",
+        2 * M_MIXED,
+        d_count
+    );
+    assert_eq!(
+        e_count,
+        2 * M_MIXED as u64,
+        "table_e: expected {} got {}",
+        2 * M_MIXED,
+        e_count
+    );
+    assert_eq!(
+        f_count,
+        2 * M_MIXED as u64,
+        "table_f: expected {} got {}",
+        2 * M_MIXED,
+        f_count
+    );
+    assert_eq!(
+        g_count,
+        2 * M_MIXED as u64,
+        "table_g: expected {} got {}",
+        2 * M_MIXED,
+        g_count
+    );
 
     // heavy_b runs in both the heavy phase (HEAVY_ROUNDS × N) and the mixed
     // phase (M_MIXED × N), so b == (HEAVY_ROUNDS + M_MIXED) × N.
@@ -265,13 +289,7 @@ async fn bench() {
 
     // a_count ≥ (HEAVY_ROUNDS + M_MIXED) × N because warm-up also writes to a.
     let min_a = (HEAVY_ROUNDS as u64 + M_MIXED as u64) * N;
-    assert!(
-        a_count >= min_a,
-        "table_a too low: expected ≥{} got {}",
-        min_a, a_count
-    );
+    assert!(a_count >= min_a, "table_a too low: expected ≥{} got {}", min_a, a_count);
 
-    println!(
-        "[bench] PASS — a={a_count} b={b_count} c={c_count} d={d_count} e={e_count} f={f_count} g={g_count}"
-    );
+    println!("[bench] PASS — a={a_count} b={b_count} c={c_count} d={d_count} e={e_count} f={f_count} g={g_count}");
 }

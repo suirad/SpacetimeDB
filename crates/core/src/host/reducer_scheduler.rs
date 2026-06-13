@@ -168,9 +168,7 @@ impl BatchingExecutor {
     pub(super) fn spawn(core: AllocatedJobCore, state: WasmtimeModuleState, name: String) -> Self {
         let AllocatedJobCore { guard, pinner } = core;
         let (job_tx, job_rx) = mpsc::unbounded_channel::<WasmJob>();
-        let handle = Self {
-            job_tx: job_tx.clone(),
-        };
+        let handle = Self { job_tx: job_tx.clone() };
 
         let rt = runtime::Handle::current();
         std::thread::Builder::new()
@@ -461,10 +459,10 @@ struct TierEntry {
 }
 
 enum AccessTier {
-    Static,                 // analyzer set exists — matrix row valid
-    Unknown(ObsState),      // static-wildcard — learning in progress
-    Learned(LearnedSet),    // promoted — trap-guarded
-    Parked,                 // strike cap hit — wildcard forever (this boot)
+    Static,              // analyzer set exists — matrix row valid
+    Unknown(ObsState),   // static-wildcard — learning in progress
+    Learned(LearnedSet), // promoted — trap-guarded
+    Parked,              // strike cap hit — wildcard forever (this boot)
 }
 
 #[derive(Default)]
@@ -954,7 +952,9 @@ fn run_batch(state: &mut WasmtimeModuleState, sched: &mut SchedulerState) {
                 // effective-actual writes (observed when captured, else static resolved).
                 match outcome_slot.as_ref().and_then(|o| o.observed.as_deref()) {
                     Some(obs) => earlier_writes.extend(obs.writes.iter().copied()),
-                    None => earlier_writes.extend(effective_write_iter(&sched.tiers, resolved, member_id).iter().copied()),
+                    None => {
+                        earlier_writes.extend(effective_write_iter(&sched.tiers, resolved, member_id).iter().copied())
+                    }
                 }
                 admitted_ids.push(member_id);
                 admitted_members.push(member);
@@ -1085,7 +1085,9 @@ fn run_batch(state: &mut WasmtimeModuleState, sched: &mut SchedulerState) {
             payload.reply_panic(panic);
             continue;
         }
-        let outcome = admitted_outcomes[i].take().expect("non-panicked member produced an outcome");
+        let outcome = admitted_outcomes[i]
+            .take()
+            .expect("non-panicked member produced an outcome");
         let duration = outcome.host_execution_duration;
         let budget = outcome.execution_budget_used;
         let caller_identity = payload.params.caller_identity;
@@ -1145,10 +1147,12 @@ fn admitted_member_sets<'a>(
     admitted_ids
         .iter()
         .zip(admitted_outcomes)
-        .map(|(&id, outcome)| match outcome.as_ref().and_then(|o| o.observed.as_deref()) {
-            Some(obs) => (TableSet::Set(&obs.reads), TableSet::Set(&obs.writes)),
-            None => effective_sets(&tiers[id.0 as usize].tier, resolved, id.0 as usize),
-        })
+        .map(
+            |(&id, outcome)| match outcome.as_ref().and_then(|o| o.observed.as_deref()) {
+                Some(obs) => (TableSet::Set(&obs.reads), TableSet::Set(&obs.writes)),
+                None => effective_sets(&tiers[id.0 as usize].tier, resolved, id.0 as usize),
+            },
+        )
         .collect()
 }
 
@@ -1216,7 +1220,10 @@ fn calibrate(sched: &mut SchedulerState) {
     }
     let median = median_duration(&mut samples);
     let t = median.saturating_mul(sched.k);
-    log::info!("reducer fork threshold (calibrated): {t:?} (k={}, median={median:?})", sched.k);
+    log::info!(
+        "reducer fork threshold (calibrated): {t:?} (k={}, median={median:?})",
+        sched.k
+    );
     sched.stats.calibrated_ns = t.as_nanos() as u64;
     sched.threshold = ThresholdState::Calibrated(t);
     // Move the worker out of Spawning into Ready.
@@ -1318,18 +1325,14 @@ fn head_cut_index<'a>(
     members: impl Iterator<Item = (TableSet<'a>, TableSet<'a>)>,
 ) -> Option<usize> {
     let head = TableSet::Set(head_obs_writes);
-    members.enumerate().find_map(|(i, (reads, writes))| {
-        (sets_intersect(&head, &reads) || sets_intersect(&head, &writes)).then_some(i)
-    })
+    members
+        .enumerate()
+        .find_map(|(i, (reads, writes))| (sets_intersect(&head, &reads) || sets_intersect(&head, &writes)).then_some(i))
 }
 
 /// Fast-path threshold gate: only meaningful with a calibrated threshold.
 fn threshold_exceeded(sched: &SchedulerState, id: ReducerId) -> bool {
-    sched.threshold.is_calibrated()
-        && sched
-            .threshold
-            .value()
-            .is_some_and(|t| sched.stat(id).exceeds(t))
+    sched.threshold.is_calibrated() && sched.threshold.value().is_some_and(|t| sched.stat(id).exceeds(t))
 }
 
 /// Admission predicate for one candidate against the already-admitted members.
@@ -1522,15 +1525,21 @@ mod tests {
         let mut name_ids: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
         let mut next = 0u32;
 
-        let resolve_names = |names: &[&str], name_ids: &mut std::collections::BTreeMap<String, u32>, next: &mut u32| -> Vec<spacetimedb_primitives::TableId> {
-            names.iter().map(|name| {
-                let id = *name_ids.entry(name.to_string()).or_insert_with(|| {
-                    let id = *next;
-                    *next += 1;
-                    id
-                });
-                spacetimedb_primitives::TableId(id)
-            }).collect()
+        let resolve_names = |names: &[&str],
+                             name_ids: &mut std::collections::BTreeMap<String, u32>,
+                             next: &mut u32|
+         -> Vec<spacetimedb_primitives::TableId> {
+            names
+                .iter()
+                .map(|name| {
+                    let id = *name_ids.entry(name.to_string()).or_insert_with(|| {
+                        let id = *next;
+                        *next += 1;
+                        id
+                    });
+                    spacetimedb_primitives::TableId(id)
+                })
+                .collect()
         };
 
         let mut read_tables = Vec::with_capacity(n);
@@ -1573,11 +1582,7 @@ mod tests {
     }
 
     /// Build a strict prefix using the production `admit`.
-    fn build_prefix_production(
-        access: &ReducerAccessInfo,
-        resolved: &ResolvedAccess,
-        queue: &[usize],
-    ) -> Vec<usize> {
+    fn build_prefix_production(access: &ReducerAccessInfo, resolved: &ResolvedAccess, queue: &[usize]) -> Vec<usize> {
         let mut admitted: Vec<usize> = Vec::new();
         for &cid in queue {
             if !admit_production(access, resolved, cid, &admitted) {
@@ -1593,8 +1598,7 @@ mod tests {
     #[test]
     fn admission_disjoint_admits() {
         // r0 writes {a}, r1 writes {b}; disjoint → both admit.
-        let (access, resolved) =
-            make_fixture(&[&[], &[]], &[&["a"], &["b"]], &[false, false], &[false, false]);
+        let (access, resolved) = make_fixture(&[&[], &[]], &[&["a"], &["b"]], &[false, false], &[false, false]);
         assert!(admit_production(&access, &resolved, 0, &[]));
         assert!(admit_production(&access, &resolved, 1, &[0]));
     }
@@ -1602,8 +1606,7 @@ mod tests {
     #[test]
     fn admission_write_write_conflict_blocks() {
         // both write {a} → conflict.
-        let (access, resolved) =
-            make_fixture(&[&[], &[]], &[&["a"], &["a"]], &[false, false], &[false, false]);
+        let (access, resolved) = make_fixture(&[&[], &[]], &[&["a"], &["a"]], &[false, false], &[false, false]);
         assert!(admit_production(&access, &resolved, 0, &[]));
         assert!(!admit_production(&access, &resolved, 1, &[0]));
     }
@@ -1611,23 +1614,20 @@ mod tests {
     #[test]
     fn admission_read_write_conflict_blocks() {
         // r0 writes {a}; r1 reads {a} → write∩read conflict.
-        let (access, resolved) =
-            make_fixture(&[&[], &["a"]], &[&["a"], &["b"]], &[false, false], &[false, false]);
+        let (access, resolved) = make_fixture(&[&[], &["a"]], &[&["a"], &["b"]], &[false, false], &[false, false]);
         assert!(!admit_production(&access, &resolved, 1, &[0]));
     }
 
     #[test]
     fn admission_read_read_admits() {
         // r0 reads {a}, r1 reads {a}, neither writes it → read∩read is free.
-        let (access, resolved) =
-            make_fixture(&[&["a"], &["a"]], &[&["x"], &["y"]], &[false, false], &[false, false]);
+        let (access, resolved) = make_fixture(&[&["a"], &["a"]], &[&["x"], &["y"]], &[false, false], &[false, false]);
         assert!(admit_production(&access, &resolved, 1, &[0]));
     }
 
     #[test]
     fn admission_lifecycle_blocks() {
-        let (access, resolved) =
-            make_fixture(&[&[], &[]], &[&["a"], &["b"]], &[false, true], &[false, false]);
+        let (access, resolved) = make_fixture(&[&[], &[]], &[&["a"], &["b"]], &[false, true], &[false, false]);
         assert!(
             !admit_production(&access, &resolved, 1, &[0]),
             "lifecycle reducer must never batch"
@@ -1636,8 +1636,7 @@ mod tests {
 
     #[test]
     fn admission_wildcard_blocks() {
-        let (access, resolved) =
-            make_fixture(&[&[], &[]], &[&["a"], &["b"]], &[false, false], &[false, true]);
+        let (access, resolved) = make_fixture(&[&[], &[]], &[&["a"], &["b"]], &[false, false], &[false, true]);
         assert!(
             !admit_production(&access, &resolved, 1, &[0]),
             "wildcard reducer must never batch"
@@ -1710,10 +1709,16 @@ mod tests {
     fn stat_exceeds_requires_both() {
         let t = Duration::from_micros(100);
         // High-water above but EMA below → does not exceed.
-        let s = Stat { high_water: Duration::from_micros(500), ema: Duration::from_micros(50) };
+        let s = Stat {
+            high_water: Duration::from_micros(500),
+            ema: Duration::from_micros(50),
+        };
         assert!(!s.exceeds(t), "EMA below threshold must block fork");
         // Both above → exceeds.
-        let s = Stat { high_water: Duration::from_micros(500), ema: Duration::from_micros(200) };
+        let s = Stat {
+            high_water: Duration::from_micros(500),
+            ema: Duration::from_micros(200),
+        };
         assert!(s.exceeds(t));
     }
 
@@ -1773,7 +1778,10 @@ mod tests {
     }
 
     fn unknown_entry() -> TierEntry {
-        TierEntry { tier: AccessTier::Unknown(ObsState::default()), strikes: 0 }
+        TierEntry {
+            tier: AccessTier::Unknown(ObsState::default()),
+            strikes: 0,
+        }
     }
 
     // ── Tier state machine: promotion gate ───────────────────────────────────
@@ -1805,7 +1813,10 @@ mod tests {
             let fresh = make_observed(&[], &[100 + i]);
             let obs = if i % 3 == 2 { &fresh } else { &stable };
             let promoted = record_observation(&mut entry, obs);
-            assert!(!promoted, "run {i} must not promote when truly new tables arrive every 3rd run");
+            assert!(
+                !promoted,
+                "run {i} must not promote when truly new tables arrive every 3rd run"
+            );
         }
     }
 
@@ -1927,7 +1938,10 @@ mod tests {
 
     #[test]
     fn tier_parked_is_terminal() {
-        let mut entry = TierEntry { tier: AccessTier::Parked, strikes: 2 };
+        let mut entry = TierEntry {
+            tier: AccessTier::Parked,
+            strikes: 2,
+        };
         let obs = make_observed(&[], &[1]);
         let promoted = record_observation(&mut entry, &obs);
         assert!(!promoted);
@@ -1945,8 +1959,12 @@ mod tests {
     fn learned_entry_for(reads: &[u32], writes: &[u32]) -> TierEntry {
         let mut r = IntSet::default();
         let mut w = IntSet::default();
-        for &t in reads { r.insert(TableId(t)); }
-        for &t in writes { w.insert(TableId(t)); }
+        for &t in reads {
+            r.insert(TableId(t));
+        }
+        for &t in writes {
+            w.insert(TableId(t));
+        }
         make_tier_entry(AccessTier::Learned(LearnedSet { reads: r, writes: w }))
     }
 
@@ -1964,14 +1982,12 @@ mod tests {
     #[test]
     fn tier_admit_static_static_unchanged() {
         // Static×Static should behave identically to the all-static baseline.
-        let (access, resolved) =
-            make_fixture(&[&[], &[]], &[&["a"], &["b"]], &[false, false], &[false, false]);
+        let (access, resolved) = make_fixture(&[&[], &[]], &[&["a"], &["b"]], &[false, false], &[false, false]);
         let tiers = all_static_tiers(2);
         assert!(admit_with_tiers(&access, &resolved, &tiers, 0, &[]));
         assert!(admit_with_tiers(&access, &resolved, &tiers, 1, &[0]));
 
-        let (access2, resolved2) =
-            make_fixture(&[&[], &[]], &[&["a"], &["a"]], &[false, false], &[false, false]);
+        let (access2, resolved2) = make_fixture(&[&[], &[]], &[&["a"], &["a"]], &[false, false], &[false, false]);
         let tiers2 = all_static_tiers(2);
         assert!(admit_with_tiers(&access2, &resolved2, &tiers2, 0, &[]));
         assert!(!admit_with_tiers(&access2, &resolved2, &tiers2, 1, &[0]));
@@ -1979,16 +1995,12 @@ mod tests {
 
     #[test]
     fn tier_admit_unknown_and_parked_always_rejected() {
-        let (access, resolved) =
-            make_fixture(&[&[], &[]], &[&["a"], &["b"]], &[false, false], &[false, false]);
+        let (access, resolved) = make_fixture(&[&[], &[]], &[&["a"], &["b"]], &[false, false], &[false, false]);
         let tiers_unknown = vec![
             make_tier_entry(AccessTier::Static),
             make_tier_entry(AccessTier::Unknown(ObsState::default())),
         ];
-        let tiers_parked = vec![
-            make_tier_entry(AccessTier::Static),
-            make_tier_entry(AccessTier::Parked),
-        ];
+        let tiers_parked = vec![make_tier_entry(AccessTier::Static), make_tier_entry(AccessTier::Parked)];
         assert!(!admit_with_tiers(&access, &resolved, &tiers_unknown, 1, &[0]));
         assert!(!admit_with_tiers(&access, &resolved, &tiers_parked, 1, &[0]));
     }
@@ -1996,11 +2008,10 @@ mod tests {
     #[test]
     fn tier_admit_learned_static_conflict_write_vs_read() {
         // Candidate Learned(writes={1}), admitted Static(reads={1}) → conflict.
-        let (access, resolved) =
-            make_fixture(&[&["t1"], &[]], &[&[], &["t1"]], &[false, false], &[false, false]);
+        let (access, resolved) = make_fixture(&[&["t1"], &[]], &[&[], &["t1"]], &[false, false], &[false, false]);
         let tiers = vec![
             make_tier_entry(AccessTier::Static),
-            learned_entry_for(&[], &[0]),  // table id 0 = "t1"
+            learned_entry_for(&[], &[0]), // table id 0 = "t1"
         ];
         // candidate=1 (Learned writes {0}), admitted=[0] (Static reads {0}): conflict.
         assert!(!admit_with_tiers(&access, &resolved, &tiers, 1, &[0]));
@@ -2009,11 +2020,10 @@ mod tests {
     #[test]
     fn tier_admit_static_learned_conflict_write_vs_read() {
         // Candidate Static(writes={t1}), admitted Learned(reads={t1}) → conflict.
-        let (access, resolved) =
-            make_fixture(&[&[], &[]], &[&["t1"], &[]], &[false, false], &[false, false]);
+        let (access, resolved) = make_fixture(&[&[], &[]], &[&["t1"], &[]], &[false, false], &[false, false]);
         let tiers = vec![
             make_tier_entry(AccessTier::Static),
-            learned_entry_for(&[0], &[]),  // Learned reads table 0 = "t1"
+            learned_entry_for(&[0], &[]), // Learned reads table 0 = "t1"
         ];
         // candidate=0 (Static writes {0}), admitted=[1] (Learned reads {0}): conflict.
         assert!(!admit_with_tiers(&access, &resolved, &tiers, 0, &[1]));
@@ -2022,12 +2032,8 @@ mod tests {
     #[test]
     fn tier_admit_learned_static_disjoint_admits() {
         // Candidate Learned(writes={99}), admitted Static(reads/writes={0..10}): disjoint.
-        let (access, resolved) =
-            make_fixture(&[&["t1"], &[]], &[&["t2"], &[]], &[false, false], &[false, false]);
-        let tiers = vec![
-            make_tier_entry(AccessTier::Static),
-            learned_entry_for(&[], &[99]),
-        ];
+        let (access, resolved) = make_fixture(&[&["t1"], &[]], &[&["t2"], &[]], &[false, false], &[false, false]);
+        let tiers = vec![make_tier_entry(AccessTier::Static), learned_entry_for(&[], &[99])];
         assert!(admit_with_tiers(&access, &resolved, &tiers, 1, &[0]));
     }
 
@@ -2036,35 +2042,23 @@ mod tests {
         // Admitted side is Static with a name-resolution wildcard (analyzer OK, resolution
         // failed): its resolved slices are empty, but its true access is unknown — the
         // Learned candidate must be rejected, never set-intersected against empty slices.
-        let (access, resolved) =
-            make_fixture(&[&["t1"], &[]], &[&["t2"], &[]], &[false, false], &[true, false]);
-        let tiers = vec![
-            make_tier_entry(AccessTier::Static),
-            learned_entry_for(&[], &[99]),
-        ];
+        let (access, resolved) = make_fixture(&[&["t1"], &[]], &[&["t2"], &[]], &[false, false], &[true, false]);
+        let tiers = vec![make_tier_entry(AccessTier::Static), learned_entry_for(&[], &[99])];
         assert!(!admit_with_tiers(&access, &resolved, &tiers, 1, &[0]));
     }
 
     #[test]
     fn tier_admit_learned_learned_write_write_conflict() {
         // Both Learned write table 42 → conflict.
-        let (access, resolved) =
-            make_fixture(&[&[], &[]], &[&[], &[]], &[false, false], &[false, false]);
-        let tiers = vec![
-            learned_entry_for(&[], &[42]),
-            learned_entry_for(&[], &[42]),
-        ];
+        let (access, resolved) = make_fixture(&[&[], &[]], &[&[], &[]], &[false, false], &[false, false]);
+        let tiers = vec![learned_entry_for(&[], &[42]), learned_entry_for(&[], &[42])];
         assert!(!admit_with_tiers(&access, &resolved, &tiers, 1, &[0]));
     }
 
     #[test]
     fn tier_admit_learned_learned_disjoint_admits() {
-        let (access, resolved) =
-            make_fixture(&[&[], &[]], &[&[], &[]], &[false, false], &[false, false]);
-        let tiers = vec![
-            learned_entry_for(&[], &[1]),
-            learned_entry_for(&[], &[2]),
-        ];
+        let (access, resolved) = make_fixture(&[&[], &[]], &[&[], &[]], &[false, false], &[false, false]);
+        let tiers = vec![learned_entry_for(&[], &[1]), learned_entry_for(&[], &[2])];
         assert!(admit_with_tiers(&access, &resolved, &tiers, 1, &[0]));
     }
 
@@ -2088,8 +2082,12 @@ mod tests {
     fn learned(reads: &[u32], writes: &[u32]) -> LearnedSet {
         let mut r = IntSet::default();
         let mut w = IntSet::default();
-        for &t in reads { r.insert(TableId(t)); }
-        for &t in writes { w.insert(TableId(t)); }
+        for &t in reads {
+            r.insert(TableId(t));
+        }
+        for &t in writes {
+            w.insert(TableId(t));
+        }
         LearnedSet { reads: r, writes: w }
     }
 
@@ -2119,7 +2117,10 @@ mod tests {
         // Write hits an earlier write.
         assert!(hazard_check(&make_observed(&[], &[11]), &earlier), "write-hit → true");
         // Disjoint reads and writes.
-        assert!(!hazard_check(&make_observed(&[1, 2], &[3, 4]), &earlier), "disjoint → false");
+        assert!(
+            !hazard_check(&make_observed(&[1, 2], &[3, 4]), &earlier),
+            "disjoint → false"
+        );
         // Empty observed.
         assert!(!hazard_check(&make_observed(&[], &[]), &earlier), "empty → false");
     }
@@ -2146,37 +2147,58 @@ mod tests {
         promote_entry(&mut entry);
         let esc = make_observed(&[], &[7]);
         // First escape demotes.
-        assert_eq!(record_escape(&mut entry, &esc), EscapeOutcome::Demoted, "first escape → Demoted");
+        assert_eq!(
+            record_escape(&mut entry, &esc),
+            EscapeOutcome::Demoted,
+            "first escape → Demoted"
+        );
         assert!(matches!(entry.tier, AccessTier::Unknown(_)));
         // Re-promote then escape again → Parked.
         for _ in 0..100 {
-            if matches!(entry.tier, AccessTier::Learned(_)) { break; }
+            if matches!(entry.tier, AccessTier::Learned(_)) {
+                break;
+            }
             record_observation(&mut entry, &esc);
         }
         assert!(matches!(entry.tier, AccessTier::Learned(_)), "re-promote failed");
-        assert_eq!(record_escape(&mut entry, &esc), EscapeOutcome::Parked, "second escape → Parked");
+        assert_eq!(
+            record_escape(&mut entry, &esc),
+            EscapeOutcome::Parked,
+            "second escape → Parked"
+        );
         assert!(matches!(entry.tier, AccessTier::Parked));
     }
 
     // head_cut_index: build per-member (reads, writes) TableSet pairs from owned IntSets.
     fn member_sets(shapes: &[(Vec<u32>, Vec<u32>)]) -> (Vec<IntSet<TableId>>, Vec<IntSet<TableId>>) {
-        let reads = shapes.iter().map(|(r, _)| r.iter().map(|&t| TableId(t)).collect()).collect();
-        let writes = shapes.iter().map(|(_, w)| w.iter().map(|&t| TableId(t)).collect()).collect();
+        let reads = shapes
+            .iter()
+            .map(|(r, _)| r.iter().map(|&t| TableId(t)).collect())
+            .collect();
+        let writes = shapes
+            .iter()
+            .map(|(_, w)| w.iter().map(|&t| TableId(t)).collect())
+            .collect();
         (reads, writes)
     }
 
-    fn pairs<'a>(
-        reads: &'a [IntSet<TableId>],
-        writes: &'a [IntSet<TableId>],
-    ) -> Vec<(TableSet<'a>, TableSet<'a>)> {
-        reads.iter().zip(writes).map(|(r, w)| (TableSet::Set(r), TableSet::Set(w))).collect()
+    fn pairs<'a>(reads: &'a [IntSet<TableId>], writes: &'a [IntSet<TableId>]) -> Vec<(TableSet<'a>, TableSet<'a>)> {
+        reads
+            .iter()
+            .zip(writes)
+            .map(|(r, w)| (TableSet::Set(r), TableSet::Set(w)))
+            .collect()
     }
 
     #[test]
     fn head_cut_index_no_conflict() {
         let head = write_union(&[100]);
         let (r, w) = member_sets(&[(vec![1], vec![2]), (vec![3], vec![4])]);
-        assert_eq!(head_cut_index(&head, pairs(&r, &w).into_iter()), None, "no conflicts → None");
+        assert_eq!(
+            head_cut_index(&head, pairs(&r, &w).into_iter()),
+            None,
+            "no conflicts → None"
+        );
     }
 
     #[test]
@@ -2184,7 +2206,11 @@ mod tests {
         // Head wrote {5}; member 1 writes 5 → cut at 1.
         let head = write_union(&[5]);
         let (r, w) = member_sets(&[(vec![1], vec![2]), (vec![3], vec![5]), (vec![6], vec![7])]);
-        assert_eq!(head_cut_index(&head, pairs(&r, &w).into_iter()), Some(1), "first write conflict at 1");
+        assert_eq!(
+            head_cut_index(&head, pairs(&r, &w).into_iter()),
+            Some(1),
+            "first write conflict at 1"
+        );
     }
 
     #[test]
@@ -2192,7 +2218,11 @@ mod tests {
         // Head wrote {9}; member 0 reads 9 (write-vs-read hazard) → cut at 0.
         let head = write_union(&[9]);
         let (r, w) = member_sets(&[(vec![9], vec![2]), (vec![3], vec![4])]);
-        assert_eq!(head_cut_index(&head, pairs(&r, &w).into_iter()), Some(0), "read conflict at 0");
+        assert_eq!(
+            head_cut_index(&head, pairs(&r, &w).into_iter()),
+            Some(0),
+            "read conflict at 0"
+        );
     }
 
     #[test]
@@ -2200,7 +2230,11 @@ mod tests {
         // Head wrote {20}; member 2 reads 20 → cut at 2, prefix [0,1) clean.
         let head = write_union(&[20]);
         let (r, w) = member_sets(&[(vec![1], vec![2]), (vec![3], vec![4]), (vec![20], vec![5])]);
-        assert_eq!(head_cut_index(&head, pairs(&r, &w).into_iter()), Some(2), "first conflict at 2");
+        assert_eq!(
+            head_cut_index(&head, pairs(&r, &w).into_iter()),
+            Some(2),
+            "first conflict at 2"
+        );
     }
 
     #[test]
@@ -2208,7 +2242,11 @@ mod tests {
         // pending already holds [9]; requeue [1,2,3] at front → [1,2,3,9].
         let mut pending: VecDeque<usize> = VecDeque::from([9]);
         push_front_in_order(&mut pending, vec![1, 2, 3]);
-        assert_eq!(pending.into_iter().collect::<Vec<_>>(), vec![1, 2, 3, 9], "head first, then members in order");
+        assert_eq!(
+            pending.into_iter().collect::<Vec<_>>(),
+            vec![1, 2, 3, 9],
+            "head first, then members in order"
+        );
     }
 
     #[test]
@@ -2217,6 +2255,10 @@ mod tests {
         let mut pending: VecDeque<usize> = VecDeque::new();
         let jobs = vec![0 /*head*/, 1, 2];
         push_front_in_order(&mut pending, jobs);
-        assert_eq!(pending.into_iter().collect::<Vec<_>>(), vec![0, 1, 2], "FIFO serial order restored");
+        assert_eq!(
+            pending.into_iter().collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "FIFO serial order restored"
+        );
     }
 }

@@ -32,8 +32,7 @@ const LEARN_RUNS: usize = 12;
 const WARM_MAX: usize = 30;
 
 lazy_static! {
-    static ref MODULE: CompiledModule =
-        CompiledModule::compile("reducer-batching-fixture-cs", CompilationMode::Debug);
+    static ref MODULE: CompiledModule = CompiledModule::compile("reducer-batching-fixture-cs", CompilationMode::Debug);
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -65,12 +64,7 @@ fn phase_deltas(
 ///
 /// `promotions_before` is the global promotions counter captured *just before* this
 /// reducer's loop starts — so we detect only ticks attributable to this reducer.
-async fn promote(
-    module: &ModuleHandle,
-    name: &str,
-    arg: Option<u64>,
-    promotions_before: u64,
-) -> Option<usize> {
+async fn promote(module: &ModuleHandle, name: &str, arg: Option<u64>, promotions_before: u64) -> Option<usize> {
     let mut observed_at: Option<usize> = None;
     for i in 0..LEARN_RUNS {
         let args_buf;
@@ -259,17 +253,16 @@ async fn bench_csharp_mixed() {
     );
 
     let snap_final = module.batch_stats().await;
-    let (final_forks, final_batches, final_widths_str, final_cal_ns, final_pool_state) =
-        match &snap_final {
-            Some(s) => (
-                s.forks,
-                s.batches,
-                format!("{:?}", s.widths),
-                format!("{:?}", s.calibrated_ns),
-                format!("{:?}", s.pool_state),
-            ),
-            None => (0, 0, "N/A".to_string(), "N/A".to_string(), "N/A".to_string()),
-        };
+    let (final_forks, final_batches, final_widths_str, final_cal_ns, final_pool_state) = match &snap_final {
+        Some(s) => (
+            s.forks,
+            s.batches,
+            format!("{:?}", s.widths),
+            format!("{:?}", s.calibrated_ns),
+            format!("{:?}", s.pool_state),
+        ),
+        None => (0, 0, "N/A".to_string(), "N/A".to_string(), "N/A".to_string()),
+    };
 
     println!(
         "CSMIXED-FINAL cap={} forks={} batches={} widths={} calibrated_ns={} pool_state={}",
@@ -283,15 +276,11 @@ async fn bench_csharp_mixed() {
         .expect("log_counts failed");
     let log = module.read_log(None).await;
     // Surface the most recent "counts a=..." line as a sanity check.
-    let counts_line = log
-        .lines()
-        .rev()
-        .filter(|l| !l.is_empty())
-        .find_map(|line| {
-            let rec: serde_json::Value = serde_json::from_str(line).ok()?;
-            let msg = rec.get("message")?.as_str()?;
-            msg.contains("counts a=").then(|| msg.to_string())
-        });
+    let counts_line = log.lines().rev().filter(|l| !l.is_empty()).find_map(|line| {
+        let rec: serde_json::Value = serde_json::from_str(line).ok()?;
+        let msg = rec.get("message")?.as_str()?;
+        msg.contains("counts a=").then(|| msg.to_string())
+    });
     match counts_line {
         Some(line) => println!("[csmixed] DB counts: {line}"),
         None => println!("[csmixed] WARNING: no 'counts a=...' line found in log"),

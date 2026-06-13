@@ -19,7 +19,6 @@ use spacetimedb_datastore::locking_tx_datastore::state_view::{
 use spacetimedb_datastore::locking_tx_datastore::{
     ApplyHistoryCounters, IndexScanPointOrRange, MutTxId, TxId, ViewCallInfo,
 };
-use spacetimedb_datastore::{FinishedBatchTx, ReducerTx};
 use spacetimedb_datastore::system_tables::{
     system_tables, StModuleRow, ST_CLIENT_ID, ST_CONNECTION_CREDENTIALS_ID, ST_VIEW_SUB_ID,
 };
@@ -35,6 +34,7 @@ use spacetimedb_datastore::{
     },
     traits::TxData,
 };
+use spacetimedb_datastore::{FinishedBatchTx, ReducerTx};
 use spacetimedb_durability::{self as durability, History};
 use spacetimedb_lib::bsatn::ToBsatn;
 use spacetimedb_lib::db::auth::StAccess;
@@ -796,7 +796,10 @@ impl RelationalDB {
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
-    pub fn begin_batch_tx(&self, workload: Workload) -> spacetimedb_datastore::locking_tx_datastore::batch_tx::BatchTxState {
+    pub fn begin_batch_tx(
+        &self,
+        workload: Workload,
+    ) -> spacetimedb_datastore::locking_tx_datastore::batch_tx::BatchTxState {
         log::trace!("BEGIN BATCH TX");
         self.inner.begin_batch_tx(workload)
     }
@@ -864,11 +867,11 @@ impl RelationalDB {
         log::trace!("COMMIT BATCH TX");
 
         let reducer_context = finished.ctx.reducer_context().cloned();
-        let (tx_data, tx_metrics, tx) =
-            self.inner
-                .commit_batch_tx_downgrade_and_then(finished, workload, |tx_data| {
-                    self.request_durability(reducer_context, tx_data);
-                });
+        let (tx_data, tx_metrics, tx) = self
+            .inner
+            .commit_batch_tx_downgrade_and_then(finished, workload, |tx_data| {
+                self.request_durability(reducer_context, tx_data);
+            });
 
         self.maybe_do_snapshot(&tx_data);
 

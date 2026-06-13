@@ -34,8 +34,13 @@ pub(crate) enum WorkerGone {
 // ─── Internal channel message ─────────────────────────────────────────────────
 
 enum WorkerJob {
-    Calibrate { reply: Sender<()> },
-    Run { job: Box<BatchRunJob>, reply: Sender<BatchRunReply> },
+    Calibrate {
+        reply: Sender<()>,
+    },
+    Run {
+        job: Box<BatchRunJob>,
+        reply: Sender<BatchRunReply>,
+    },
 }
 
 // ─── Thin internal trait for testability ─────────────────────────────────────
@@ -107,7 +112,10 @@ impl ReducerWorker {
     pub fn dispatch(&self, job: BatchRunJob) -> Result<Receiver<BatchRunReply>, WorkerGone> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.job_tx
-            .send(WorkerJob::Run { job: Box::new(job), reply: reply_tx })
+            .send(WorkerJob::Run {
+                job: Box::new(job),
+                reply: reply_tx,
+            })
             .map_err(|_| WorkerGone::Exited)?;
         Ok(reply_rx)
     }
@@ -293,8 +301,7 @@ mod tests {
     }
 
     fn make_test_db() -> Arc<RelationalDB> {
-        let test_db = crate::db::relational_db::tests_utils::TestDB::in_memory()
-            .expect("TestDB::in_memory failed");
+        let test_db = crate::db::relational_db::tests_utils::TestDB::in_memory().expect("TestDB::in_memory failed");
         Arc::clone(&test_db.db)
     }
 
