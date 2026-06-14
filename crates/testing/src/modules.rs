@@ -159,6 +159,31 @@ impl ModuleHandle {
         self.client.module().batch_stats().await
     }
 
+    /// Hot-swap (republish) the module backing this handle with `compiled`'s program
+    /// bytes on the same database identity. The host controller rebuilds the
+    /// `ModuleHost` (and its scheduler) and swaps it into the live watch channel via
+    /// `send_replace`, so this handle's client transparently observes the new host.
+    /// Returns once the swap (and any auto-migration) has completed.
+    pub async fn republish(&self, compiled: &CompiledModule) -> anyhow::Result<()> {
+        use spacetimedb_client_api::DatabaseDef;
+        use spacetimedb_schema::auto_migrate::MigrationPolicy;
+        self._env
+            .publish_database(
+                &Identity::ZERO,
+                DatabaseDef {
+                    database_identity: self.db_identity,
+                    program_bytes: compiled.program_bytes(),
+                    num_replicas: None,
+                    host_type: compiled.host_type,
+                    parent: None,
+                    organization: None,
+                },
+                MigrationPolicy::Compatible,
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn read_log(&self, size: Option<u32>) -> String {
         let bytes = self
             .client
