@@ -6,13 +6,13 @@
 //! returns wildcard for every C# reducer. Both `run_game_circles` and
 //! `run_game_ia_loop` therefore start at `Unknown` tier. v2's only batching lever
 //! is Phase-6 LEARNING (Unknown→Learned via inline capture). Run under both caps:
-//!   STDB_REDUCER_POOL_CAP=0  → base lane (no pool, never forks)
-//!   STDB_REDUCER_POOL_CAP=1  → v2 lane  (learned fork path)
+//!   STDB_REDUCER_BATCHING=0  → base lane (no pool, never forks)
+//!   STDB_REDUCER_BATCHING=1  → v2 lane  (learned fork path)
 //!
 //! Run explicitly (skipped in normal CI):
 //!   cargo test -p spacetimedb-testing --test csharp_batching_bench -- --ignored --nocapture
 //!
-//! Set STDB_REDUCER_POOL_CAP externally before running to label the output;
+//! Set STDB_REDUCER_BATCHING externally before running to label the output;
 //! default label is "1". This test never sets that variable itself.
 
 use lazy_static::lazy_static;
@@ -41,7 +41,7 @@ lazy_static! {
 #[tokio::test]
 #[ignore]
 async fn bench_csharp_base_v2() {
-    let cap_label = std::env::var("STDB_REDUCER_POOL_CAP").unwrap_or_else(|_| "1".to_string());
+    let cap_label = std::env::var("STDB_REDUCER_BATCHING").unwrap_or_else(|_| "1".to_string());
 
     let module = MODULE.load_module(DEFAULT_CONFIG, None).await;
 

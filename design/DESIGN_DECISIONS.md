@@ -943,7 +943,7 @@ construction under the batch's read window.
   Updated post-commit for inline and forked runs; reset on republish (ids
   change; init-0 ⇒ first run always inline per §9). EMA α = 1/8. Fork condition:
   both high_water AND ema > THRESHOLD (§9, settled).
-- Config: `STDB_REDUCER_POOL_CAP` (default 1; **0 = hard kill switch** — the
+- Config: `STDB_REDUCER_BATCHING` (default on; **0 = hard kill switch** — the
   kill-criterion "leave dormant" lever) and `STDB_REDUCER_FORK_K` (default 4 —
   GO data: heavy fixture cleared k=3, marginal at k=5). Same env-var pattern as
   the shadow flags it replaces.
@@ -1099,6 +1099,45 @@ not).
 O(1) cost class. All-static batches skip trap validation entirely. Capture is
 enabled only on tiers that today cannot batch at all (`Unknown` learning
 inline, `Learned` trap evidence).
+
+### 19.9 Fork profitability — TAIL-COST GATE (decided 2026-06-19, benchmark-driven)
+The v1 executor is 2-lane: the head runs on the single worker; admitted members
+run on the home/loop thread sequentially; commits drain FIFO (head first). Fork
+saving vs serial is therefore `min(head_body, Σtail_body)` — the commit drain is
+serial either way and cancels. The head already cleared the entry threshold, so
+the binding question is the TAIL: **fork only when the admissible disjoint tail's
+estimated body cost also clears the fork threshold.**
+
+- **Replaces the lone-head guard** ("fork iff any companion exists"), which
+  over-forked: a heavy head with only cheap members ties up the worker for the
+  head's whole duration to overlap microseconds of cheap work — net loss once
+  fork overhead + per-member tx/view-check cost are paid.
+- `tail_est` = sum of per-reducer runtime EMAs over the admissible front-prefix
+  (same walk as the Step-4 admission loop). It is an upper bound (Step 4 may cut
+  members on a view/trap) ⇒ only over-forks at the margin, never under.
+- **Bar = the live fork threshold** (`k × fork_cost`). Swept alternatives —
+  break-even (`1×fork_cost`), `2×fork_cost`, head-relative `0.75×(head+fork_cost)`
+  — all lost or tied. Real per-member batch overhead exceeds the calibrated
+  `fork_cost`, so the conservative full-threshold bar is both best AND simplest
+  (`tail_est >= threshold`; no multiply/divide/head-EMA). The bar knobs were
+  prototyped, measured, and **dropped**.
+- **Always-on** (no env toggle — locked in). Diagnostic only: `STDB_BATCH_LOG=1`
+  logs `batches/forks/widths` every 100 batches.
+- Measured (keynote-2 transfer harness, network + confirmed reads, seeded +
+  5-run avg, vs the lone-head guard): **+6.4%** cheap-tail mix, **+7.1%** medium,
+  **+15.1%** realistic tri-class (10% heavy / 30% medium / 60% cheap); width-2
+  balanced pairs 1.56×→**1.66×**. Wins or ties in every workload tested.
+
+### 19.10 Feature switch — `STDB_REDUCER_POOL_CAP` → `STDB_REDUCER_BATCHING` (2026-06-19)
+The numeric pool cap was redundant: v1 honors exactly one worker, and the bench
+sweep showed no gain from a higher cap (the win is the 2-lane overlap, not worker
+count — §19.9). Collapsed to a **boolean feature switch**: `STDB_REDUCER_BATCHING`,
+**default on**; disable (the synchronous #5095 kill-switch lane) with
+`0`/`false`/`off`/`no`. The internal worker count stays 1 (raising it is a Phase-2
+question, gated on evidence of 3+ simultaneously-runnable heavy disjoint reducers).
+`STDB_REDUCER_FORK_K` (threshold multiple) is unchanged. Code: `BATCHING_ENV` +
+`read_env_bool` in `reducer_scheduler.rs`; the `reducer_batching_off_test` kill-
+switch test and the keynote/bench harnesses use the new name.
 
 ## Open questions (not yet decided)- **k runtime adaptation:** fixed k for v1; revisit whether k should adapt to
   observed mis-fork rate.
@@ -1423,7 +1462,7 @@ lean-comment audit (40 kept / 32 dropped / 18 reframed; no task-refs remain).
   (do width≥2 batches with members ≥ k×62µs occur at meaningful rates?) is
   unanswered by design — self-authored fixture caveat (§17 honesty note). The
   feature self-protects: lazy pool = zero threads until a heavy reducer
-  appears; `STDB_REDUCER_POOL_CAP=0` is the hard kill switch; cap stays 1
+  appears; `STDB_REDUCER_BATCHING=0` is the hard kill switch; worker count stays 1
   pending real-workload evidence (HANDOFF §5 design call).
 - **Post-build amendments (user, 2026-06-11):** (1) wildcard short-circuits
   `fork_eligible` FIRST via a new static `ReducerAccessInfo.wildcard` vec (no
@@ -1436,7 +1475,7 @@ lean-comment audit (40 kept / 32 dropped / 18 reframed; no task-refs remain).
 - **A/B benchmark (2026-06-12, release host, same binary, cap=1 vs cap=0 —
   isolates the feature):** harness `crates/testing/tests/reducer_batching_bench.rs`
   (`cargo test -p spacetimedb-testing --test reducer_batching_bench --release --
-  --ignored --nocapture`, set `STDB_REDUCER_POOL_CAP=0` for the off arm).
+  --ignored --nocapture`, set `STDB_REDUCER_BATCHING=0` for the off arm).
   Workload: 40 rounds of concurrent disjoint pairs `heavy_a(20k)‖heavy_b(20k)`
   (debug-wasm module) + 2000 sequential `cheap_a`. Three runs per arm:
   - heavy: **38.8 ms/round (cap=1) vs 59.4 ms/round (cap=0) ⇒ 1.53× speedup**;
@@ -1551,7 +1590,7 @@ vs the calibrated threshold; then the design verdict on the data.
 ### Kill-criterion validation — stage 2: dynamic circles bench (2026-06-12)
 
 New harness `crates/testing/tests/circles_batching_bench.rs` (`#[ignore]`d,
-mirrors `reducer_batching_bench` idioms; off-arm via `STDB_REDUCER_POOL_CAP=0`)
+mirrors `reducer_batching_bench` idioms; off-arm via `STDB_REDUCER_BATCHING=0`)
 driving the REAL `benchmarks` module compiled **Release** (shipping-shape
 analyzer sets gate admission). Seed: entity/circle/food 100 each (so
 `run_game_circles` ≈ 10⁶ pure-read inner iterations ≈ 35ms/call), position/
@@ -1708,7 +1747,7 @@ in-tree.
 
 Measurement-only (no engine changes). All numbers are single-run point
 estimates on one machine; the qualitative signals (forks vs no-forks, width
-histograms) are the robust part. base = `STDB_REDUCER_POOL_CAP=0` (pool Off,
+histograms) are the robust part. base = `STDB_REDUCER_BATCHING=0` (pool Off,
 synchronous #5095 lane); v1 = cap=1, static-only batching; v2 = cap=1, learned.
 
 **Rust three-way** (`crates/testing/tests/circles_batching_bench.rs::bench_three_way`,
@@ -1747,3 +1786,55 @@ workload (`dotnet publish` → `bin/<cfg>/net8.0/wasi-wasm/AppBundle/StdbModule.
 the testing harness builds it via `spacetimedb_cli::build` (language-agnostic).
 New artifacts (measurement-only, no engine change): `bench_three_way`,
 `csharp_batching_bench.rs`, `csharp_mixed_bench.rs`, `modules/reducer-batching-fixture-cs/`.
+
+### Keynote-2 network benchmark + tail-cost gate (2026-06-19)
+
+Ran the `templates/keynote-2` fund-transfer benchmark (real network + WS +
+confirmed-reads, the flagship contention harness) against a workspace server,
+toggling batching off vs on (the env is `STDB_REDUCER_BATCHING`; 0 = off baseline,
+default on — at the time this knob was the numeric `STDB_REDUCER_POOL_CAP`, since
+collapsed to a boolean, see §19.10).
+Built Rust + TS modules for several workloads; server + publish/seed via the
+workspace `spacetimedb-cli`/`-standalone` (not the stale installed binary).
+
+**Executor shape confirmed (load-bearing for everything below):** v1 honors
+**only 1 worker** (`reducer_scheduler.rs` "only 1 honored in v1"). Per batch the
+**head runs on that worker, members run on the home thread sequentially**, then
+commits **drain FIFO (head first)**. Consequences:
+- Per-batch parallelism is ~2-way; **width-2 (one head + one member) is the
+  sweet spot** (`W/(W-1)` saving → 2× at W=2, 1.25× at W=5). Wider batches pile
+  members onto the home thread, so K=5 underperformed K=2.
+- Batches are **serial** (loop blocks at drain on the head) — no cross-batch
+  pipelining of the offloaded head.
+- FIFO drain **yokes member acks to the head**: a cheap member batched behind a
+  heavy head can't ack until the heavy finishes (latency, not decoupling).
+
+**Batching efficacy by workload (relative TPS, same binary, cap 0 vs 1):**
+- Single-table `transfer` (the actual keynote workload): self-conflicts on the
+  one `accounts` table ⇒ unbatchable ⇒ TS ≈ Rust base ≈ Rust batching (commit/
+  WS-latency-bound). Batching is **regression-safe** here (≈ flat), not a speedup.
+- Batching needs reducers that are **both** heavy (> fork threshold) **and**
+  access-disjoint **and** a deep enough queue (pipelining) to pair them; then
+  width-2 heavy pairs hit **~1.66–1.73×**.
+
+**Tail-cost gate (§19.9) decision data** — keynote workloads, seeded + 5-run
+avg (cv < 1%), vs the lone-head guard:
+
+| workload | batching no-gate | + full-threshold gate |
+|---|---:|---:|
+| cheap-tail mix | +1.1% | **+6.4%** |
+| medium members | +6.3% | **+7.1%** |
+| tri-class (10% heavy/30% med/60% cheap) | +11.4% | **+15.1%** |
+| width-2 balanced heavy | 1.56× | **1.66×** |
+
+Bar sweep (`MULT×fork_cost` for M∈{1,2,4}, head-relative `0.75×(head+fork_cost)`)
+confirmed the **full threshold** (`tail_est >= threshold`) wins or ties and is
+simplest; aggressive bars over-fork because real per-member overhead > calibrated
+`fork_cost`. Knobs removed; gate is unconditional. Code: `record_width`'s
+`STDB_BATCH_LOG` diagnostic + the Step-2 tail-cost guard in `run_batch`.
+
+Bench artifacts (measurement-only, in `templates/keynote-2/`): modules
+`rust_module_sharded`, `spacetimedb_sharded`, `rust_module_mixed`,
+`spacetimedb_mixed`, `rust_module_medium`, `rust_module_tri`; the `STDB_MIX` /
+`STDB_SHARDS` / seeded-PRNG connector path in `src/connectors/spacetimedb.ts`;
+runner scripts `run_bench_matrix.sh` + `verify_*.sh`.

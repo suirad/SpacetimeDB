@@ -20,6 +20,23 @@ snapshot; serialize the commits in FIFO order.
 
 ## Progress log
 
+- **Tail-cost fork gate — ✅ BUILT + LOCKED IN (2026-06-19, default-on).**
+  `run_batch` Step 2 replaces the lone-head "any companion" guard with a
+  profitability gate: estimate the admissible disjoint tail's body cost (sum of
+  per-reducer EMAs over the same front-prefix the admission loop walks) and fork
+  only when it clears the fork threshold. Rationale: on the 2-lane executor the
+  fork saving is `min(head, Σtail)` and the head already cleared the threshold, so
+  a heavy head with only cheap members can't recoup the fork cost — run it inline.
+  Bar variants (`MULT×fork_cost`, head-relative `0.75×(head+fork_cost)`) were
+  prototyped + swept against cheap/medium/tri-class workloads and **dropped** —
+  the full threshold wins/ties and is simplest. Always-on (no toggle);
+  `STDB_BATCH_LOG=1` is the only added env (diagnostic: logs `batches/forks/widths`
+  every 100 batches). Measured vs lone-head guard on the keynote-2 network bench
+  (seeded, 5-run avg): **+6.4 / +7.1 / +15.1%** (cheap / medium / realistic
+  tri-class); width-2 balanced 1.56×→**1.66×**. Independent opus review caught a
+  default-off-parity slip (fixed); `cargo check -p spacetimedb-core` green. Full
+  record: DESIGN §19.9 + log "Keynote-2 network benchmark + tail-cost gate".
+
 - **Phase 6 — learned sets + early-cut trap — ✅ BUILT (2026-06-12).** Executed
   `design/PHASE6_PLAN.md` U1–U8 via the dev-time tiered pipeline (sonnet
   U1/U2/U4/U6/U7, opus U3/U5), per-unit test gates, independent opus review of
@@ -168,7 +185,7 @@ snapshot; serialize the commits in FIFO order.
   §18 forks with the user. Shapes: `crates/core/src/host/reducer_scheduler.rs`
   (`BatchingExecutor` — typed `WasmJob::{Async,Sync,Reducer}` loop forked from
   `util/jobs.rs`, threshold-gated strict-prefix batching, two-stage calibration,
-  `STDB_REDUCER_POOL_CAP`/`STDB_REDUCER_FORK_K`), `wasm_common/reducer_worker.rs`
+  `STDB_REDUCER_BATCHING`/`STDB_REDUCER_FORK_K`), `wasm_common/reducer_worker.rs`
   (self-constructing pinned worker, trap self-heal, channel-drop shutdown),
   `wasm_common/reducer_access.rs` (unconditional analyzer wiring + matrix +
   lazy name→TableId resolution), body/commit split in `module_host_actor.rs`
@@ -371,8 +388,12 @@ calibration.** The pseudocode below predates §18; where they disagree, §18 win
 replacement; fork-cost measurement is the §18.4 two-stage calibration).
 **Post-build (2026-06-11): the "fork the heaviest" rule below is SUPERSEDED —
 the HEAD forks (user decision; §13 supersession note + §18 amendments). The
-as-built flow: lone-head guard → begin+view-check head → dispatch → per-member
+as-built flow: tail-cost gate → begin+view-check head → dispatch → per-member
 admit/begin/check/execute pipeline on home → join → FIFO drain.**
+**Post-build (2026-06-19): the Step-2 guard is now the TAIL-COST GATE (DESIGN
+§19.9), not the lone-head "any companion" guard — fork only when the admissible
+disjoint tail's EMA-summed cost clears the fork threshold (saving = `min(head,
+Σtail)`).**
 Control flow:
 
 ```

@@ -14,6 +14,7 @@ use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use futures::future::LocalBoxFuture;
@@ -41,10 +42,11 @@ use super::module_host::WasmtimeModuleState;
 
 // ─── Config (read once at construction) ──────────────────────────────────────
 
-/// `0` ⇒ the worker pool is `Off` forever (kill switch); otherwise the cap on
-/// lazily-spawned workers (only `1` is honored in v1).
-const POOL_CAP_ENV: &str = "STDB_REDUCER_POOL_CAP";
-const POOL_CAP_DEFAULT: usize = 1;
+/// Reducer batching on/off. Default ON; disable (synchronous #5095 lane, the
+/// kill switch) with `0`/`false`/`off`/`no`. v1 runs one worker, so this is a
+/// boolean, not a numeric cap.
+const BATCHING_ENV: &str = "STDB_REDUCER_BATCHING";
+const BATCHING_DEFAULT: bool = true;
 /// Fork iff a reducer's measured runtime exceeds `k × calibrated_fork_cost`.
 const FORK_K_ENV: &str = "STDB_REDUCER_FORK_K";
 const FORK_K_DEFAULT: u32 = 4;
@@ -54,13 +56,20 @@ const EMA_SHIFT: u32 = 3;
 /// Number of round-trips averaged for the proxy and calibration measurements.
 const CALIBRATION_SAMPLES: usize = 32;
 
-fn read_env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+fn read_env_bool(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"),
+        Err(_) => default,
+    }
 }
 
 fn read_env_u32(name: &str, default: u32) -> u32 {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
+
+/// `STDB_BATCH_LOG=1` logs batch/fork/width counters every 100 batches (diagnostics).
+static BATCH_LOG: LazyLock<bool> =
+    LazyLock::new(|| matches!(std::env::var("STDB_BATCH_LOG").as_deref(), Ok("1") | Ok("true")));
 
 // ─── Job payloads ─────────────────────────────────────────────────────────────
 
@@ -415,7 +424,7 @@ impl ThresholdState {
 }
 
 enum PoolState {
-    /// Kill switch (`STDB_REDUCER_POOL_CAP=0`): never spawns.
+    /// Kill switch (`STDB_REDUCER_BATCHING=0`): never spawns.
     Off,
     Empty,
     /// Worker spawned, not yet ready / not yet calibrated.
@@ -444,6 +453,12 @@ impl BatchStats {
     fn record_width(&mut self, width: usize) {
         let bucket = width.clamp(1, 5) - 1;
         self.widths[bucket] += 1;
+        if *BATCH_LOG && self.batches % 100 == 0 {
+            log::info!(
+                "[batch] batches={} forks={} widths={:?}",
+                self.batches, self.forks, self.widths
+            );
+        }
     }
 }
 
@@ -542,7 +557,7 @@ struct SchedulerState {
     threshold: ThresholdState,
     pool: PoolState,
     access: Arc<ReducerAccessInfo>,
-    cap: usize,
+    batching: bool,
     k: u32,
     stats: BatchStats,
     tiers: Vec<TierEntry>,
@@ -550,12 +565,12 @@ struct SchedulerState {
 
 impl SchedulerState {
     fn new(state: &WasmtimeModuleState) -> Self {
-        let cap = read_env_usize(POOL_CAP_ENV, POOL_CAP_DEFAULT);
+        let batching = read_env_bool(BATCHING_ENV, BATCHING_DEFAULT);
         let k = read_env_u32(FORK_K_ENV, FORK_K_DEFAULT);
         let access = state.actor().reducer_access();
         let n = access.lifecycle.len();
 
-        let (threshold, pool) = if cap == 0 {
+        let (threshold, pool) = if !batching {
             (ThresholdState::Off, PoolState::Off)
         } else {
             // Startup proxy: median in-process thread round-trip × k. Gates only the
@@ -585,7 +600,7 @@ impl SchedulerState {
             threshold,
             pool,
             access,
-            cap,
+            batching,
             k,
             stats: BatchStats::default(),
             tiers,
@@ -732,18 +747,33 @@ fn run_batch(state: &mut WasmtimeModuleState, sched: &mut SchedulerState) {
     let mut head = *head_boxed;
     let head_id = head.params.reducer_id;
 
-    // ── Step 2: lone-head guard ────────────────────────────────────────────────
+    // ── Step 2: tail-cost profitability gate ───────────────────────────────────
     //
-    // Scan pending for the first admissible companion. If none exists, forking
-    // with home idle is strictly worse than running inline — skip the fork.
-    let has_companion = {
+    // On the 2-lane executor (head on a worker, members on home) the fork saving
+    // is `min(head, Σtail)`; the head already cleared the threshold at the entry
+    // gate, so fork only when the disjoint tail also clears it. A heavy head with
+    // only cheap members can't recoup the fork cost — run it inline instead. The
+    // tail is the admissible disjoint prefix (same front-walk as Step 4); its cost
+    // is summed from per-reducer EMAs. `tail_est` is an upper bound (Step 4 may cut
+    // members on a view/trap), so this only ever over-forks at the margin, never
+    // under.
+    let tail_est = {
         let tiers = &sched.tiers;
-        sched.pending.iter().any(|job| {
-            let WasmJob::Reducer(p) = job else { return false };
-            admit(&access, resolved, tiers, p.params.reducer_id, &[head_id])
-        })
+        let mut combined = vec![head_id];
+        let mut sum = Duration::ZERO;
+        for job in sched.pending.iter() {
+            let WasmJob::Reducer(p) = job else { break };
+            let cid = p.params.reducer_id;
+            if admit(&access, resolved, tiers, cid, &combined) {
+                sum += sched.stat(cid).ema;
+                combined.push(cid);
+            } else {
+                break;
+            }
+        }
+        sum
     };
-    if !has_companion {
+    if !sched.threshold.value().is_some_and(|t| tail_est >= t) {
         run_inline(head, state, sched);
         return;
     }
@@ -1174,7 +1204,7 @@ fn maybe_spawn_or_calibrate(state: &mut WasmtimeModuleState, sched: &mut Schedul
     match &sched.pool {
         PoolState::Off | PoolState::Ready(_) => {}
         PoolState::Empty => {
-            if sched.cap >= 1 && stat_trips(sched, just_ran) {
+            if sched.batching && stat_trips(sched, just_ran) {
                 let worker = spawn_worker(state);
                 sched.pool = PoolState::Spawning(worker);
             }
@@ -1725,9 +1755,9 @@ mod tests {
     // ── Threshold machine transitions ────────────────────────────────────────
 
     #[test]
-    fn threshold_off_stays_off_when_cap_zero() {
-        // Construction with cap 0 yields Off/Off; modeled directly here since the
-        // real ctor needs a WasmtimeModuleState.
+    fn threshold_off_stays_off_when_batching_disabled() {
+        // Construction with batching disabled yields Off/Off; modeled directly here
+        // since the real ctor needs a WasmtimeModuleState.
         let threshold = ThresholdState::Off;
         assert!(threshold.value().is_none());
         assert!(!threshold.is_calibrated());

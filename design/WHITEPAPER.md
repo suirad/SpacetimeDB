@@ -2,9 +2,11 @@
 ## Provably-Safe, Profit-Gated Parallelism via Static Access Analysis and Strict-Prefix Batching
 
 > **Status of this document.** Technical whitepaper covering the design as of
-> 2026-06-13. **Phases 0–6 are built, reviewed-adequate, and measured** (all
+> 2026-06-19. **Phases 0–6 are built, reviewed-adequate, and measured** (all
 > test suites green); the verdict-mandated gate — learned access sets + the
-> early-cut trap — is satisfied, and the next step is the upstream PR.
+> early-cut trap — is satisfied, and the next step is the upstream PR. Latest
+> refinement (2026-06-19): a **tail-cost fork gate** validated on a real-network
+> benchmark — see [§4.1](#41-measured-performance) and [§5.4](#54-the-scheduler-batchingexecutor).
 > Cross-language results (Rust, C#) are included; TypeScript/V8 batching is
 > deferred (its host does not yet run the batching executor). Companion
 > documents: [`DESIGN_DECISIONS.md`](DESIGN_DECISIONS.md) (full decision log,
@@ -213,8 +215,8 @@ redesign.
 
 ### 4.1 Measured performance
 
-All numbers are A/B on identical binaries, batching on (`POOL_CAP=1`) vs off
-(`POOL_CAP=0`), release builds.
+All numbers are A/B on identical binaries, batching on
+(`STDB_REDUCER_BATCHING=1`, the default) vs off (`=0`), release builds.
 
 | Workload | Speedup | Notes |
 |---|---|---|
@@ -229,6 +231,27 @@ The "real module" is the in-repo `benchmarks` module (the circles/ia-loop
 game simulation), compiled in shipping shape (Release + wasm-opt) and **not
 written with this feature in mind**. Batch members in these runs exceeded the
 profitability threshold by ~135× — these are not marginal forks.
+
+**Over a real network (the strongest test so far).** The benches above drive an
+in-process server; the `keynote-2` fund-transfer harness instead runs the full
+client path — real network, WebSocket, confirmed reads — and is the most
+realistic measurement to date. Two findings, both honest:
+
+- **It is regression-safe where it can't help.** The flagship single-table
+  `transfer` workload self-conflicts on the one `accounts` table, so it is
+  *unbatchable*; batching on vs off is flat (commit/latency-bound), not a
+  speedup and not a slowdown. Batching only engages when reducers are heavy,
+  access-disjoint, *and* the queue is deep enough to pair them.
+- **On a realistic mix it pays.** A tri-class workload (10% heavy / 30% medium
+  / 60% cheap) ran **+15.1%** throughput with batching on, and balanced width-2
+  heavy pairs reached **1.66×** — over a real network, seeded, 5-run average.
+
+These network numbers also reflect the **tail-cost gate** (§5.4): forking only
+when the disjoint tail is itself heavy enough to pay for the worker. Versus the
+earlier "fork whenever a companion exists" rule, the gate added **+6.4% / +7.1%
+/ +15.1%** on cheap-tail / medium / tri-class mixes and lifted balanced
+width-2 from 1.56× to 1.66× — it wins or ties on every workload tested, and is
+always on.
 
 ### 4.2 Cross-language results: static path vs learned path
 
@@ -271,7 +294,7 @@ Three things this table establishes:
   threshold?) plus an O(1) wildcard/tier check before today's inline path.
 - An unmeasured reducer always runs inline first (stats initialize to zero),
   so the system never forks a reducer it has no timing data for.
-- `STDB_REDUCER_POOL_CAP=0` is a hard kill switch restoring exactly today's
+- `STDB_REDUCER_BATCHING=0` is a hard kill switch restoring exactly today's
   behavior.
 
 This dormant posture is the deployment story: the feature can merge and ship
@@ -438,9 +461,17 @@ Per dequeued reducer:
    EMA (α = 1/8) must exceed the threshold. High-water alone is permanently
    poisoned by one outlier; EMA alone forgets "can be expensive." Requiring
    both means "routinely and provably expensive."
-3. **Lone-head guard.** Scan the pending queue for at least one admissible
-   companion; if none exists, run the head inline — forking a lone reducer
-   just makes the home thread idle-wait, strictly worse than inline.
+3. **Tail-cost gate.** On the 2-lane executor (head on the worker, members on
+   home, FIFO drain), the saving over running serially is `min(head, Σtail)` —
+   the commit drain is serial either way and cancels. The head already cleared
+   the threshold, so the binding question is the *tail*: fork only when the
+   admissible disjoint tail's estimated body cost (the sum of per-reducer EMAs
+   over the same prefix the admission loop walks) also clears the fork
+   threshold. This replaces the earlier "any companion exists" guard, which
+   over-forked — a heavy head with only cheap members ties up the worker to
+   overlap microseconds of work and loses once fork overhead is paid. The
+   estimate is an upper bound (the prefix may later be cut), so it can only
+   over-fork at the margin, never skip a profitable fork. Always on.
 4. **Head-fork.** Begin the head's overlay, check it against live
    materialized-view read sets, and dispatch it to the worker. The head is
    the right fork choice because it is the only member with *proven*
@@ -718,16 +749,20 @@ The implementation maintains, and is tested against, the following:
 
 | Surface | Default | Meaning |
 |---|---|---|
-| `STDB_REDUCER_POOL_CAP` | `1` | Max workers per module; `0` = hard off switch (today's behavior exactly) |
+| `STDB_REDUCER_BATCHING` | on | Boolean feature switch; `0`/`false`/`off`/`no` = hard off switch (today's behavior exactly). Internal worker count is fixed at 1 |
 | `STDB_REDUCER_FORK_K` | `4` | Profitability multiplier: fork only if runtime > k × calibrated fork cost |
+| `STDB_BATCH_LOG` | off | Diagnostic only: logs batches/forks/widths every 100 batches. The tail-cost gate itself has no toggle (always on) |
 | `ModuleHost::batch_stats()` | — | Snapshot: batches, forks, width histogram, calibrated fork cost, pool state; Phase 6 adds promotion/demotion/trap counters |
 
 ## 9. Limitations and Future Work
 
-- **Width is capped at 2** (home + one worker) in v1. Three or more
-  simultaneously-runnable heavy disjoint reducers serialize the overflow.
-  The cap is a config value; raising the default wants evidence that the
-  3+-wide regime exists in production.
+- **Width is capped at 2** (home + one worker) in v1, and width-2 is the sweet
+  spot, not a floor. With one worker, the head runs in parallel while extra
+  members pile sequentially onto the home thread, so wider batches add less
+  each step (the saving is `(W−1)/W` of a lane) — a measured K=5 underperformed
+  K=2. Three or more simultaneously-runnable heavy disjoint reducers serialize
+  the overflow. The cap is a config value; raising the default wants evidence
+  that the 3+-wide regime exists in production.
 - **Conflict granularity is the table.** High-contention single tables
   serialize; row-level analysis is not statically recoverable and is
   explicitly out of scope.

@@ -10,7 +10,7 @@
 //! MAX_ROUNDS rounds of concurrent pairs). If the loop exhausts without a
 //! fork we print a message and skip the fork assertion — this happens only
 //! when the test environment can't physically produce a ready pool (e.g.
-//! STDB_REDUCER_POOL_CAP=0 was set externally, or the calibration threshold
+//! STDB_REDUCER_BATCHING=0 was set externally, or the calibration threshold
 //! landed above the heavy reducer's runtime). n=5_000 rows is chosen so that
 //! even debug-mode inserts (~1–2 µs each) yield a ~5–10 ms reducer body,
 //! which is well above any realistic fork threshold.

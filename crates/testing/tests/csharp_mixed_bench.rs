@@ -11,10 +11,10 @@
 //! Run explicitly (skipped in normal CI):
 //!   cargo test -p spacetimedb-testing --test csharp_mixed_bench -- --ignored --nocapture
 //!
-//! Set STDB_REDUCER_POOL_CAP externally before running to label the output;
+//! Set STDB_REDUCER_BATCHING externally before running to label the output;
 //! default label is "1". This test never sets that variable itself.
-//!   STDB_REDUCER_POOL_CAP=0  → base lane (no pool, no forks, Unknown stays Unknown)
-//!   STDB_REDUCER_POOL_CAP=1  → v2 lane  (learned fork path)
+//!   STDB_REDUCER_BATCHING=0  → base lane (no pool, no forks, Unknown stays Unknown)
+//!   STDB_REDUCER_BATCHING=1  → v2 lane  (learned fork path)
 
 use futures::future::join_all;
 use lazy_static::lazy_static;
@@ -105,7 +105,7 @@ async fn promote(module: &ModuleHandle, name: &str, arg: Option<u64>, promotions
 #[ignore]
 async fn bench_csharp_mixed() {
     // Read cap label BEFORE touching the module so we reflect what the caller configured.
-    let cap_label = std::env::var("STDB_REDUCER_POOL_CAP").unwrap_or_else(|_| "1".to_string());
+    let cap_label = std::env::var("STDB_REDUCER_BATCHING").unwrap_or_else(|_| "1".to_string());
 
     // ── 1. Fresh module instance ─────────────────────────────────────────────
     let module = MODULE.load_module(DEFAULT_CONFIG, None).await;

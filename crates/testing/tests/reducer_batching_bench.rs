@@ -4,7 +4,7 @@
 //! Run explicitly (skipped in normal CI):
 //!   cargo test -p spacetimedb-testing --test reducer_batching_bench -- --ignored --nocapture
 //!
-//! Set STDB_REDUCER_POOL_CAP externally before running to label the output;
+//! Set STDB_REDUCER_BATCHING externally before running to label the output;
 //! default label is "1" (one-worker pool). This test never sets that var itself.
 
 use futures::future::join_all;
@@ -58,7 +58,7 @@ fn parse_counts(log: &str) -> Option<(u64, u64, u64, u64, u64, u64, u64)> {
 async fn bench() {
     // Read cap label BEFORE touching the module so we reflect the env the
     // caller configured, not a value we injected ourselves.
-    let cap_label = std::env::var("STDB_REDUCER_POOL_CAP").unwrap_or_else(|_| "1".to_string());
+    let cap_label = std::env::var("STDB_REDUCER_BATCHING").unwrap_or_else(|_| "1".to_string());
 
     let module = MODULE.load_module(DEFAULT_CONFIG, None).await;
 

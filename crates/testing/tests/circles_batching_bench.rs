@@ -6,7 +6,7 @@
 //! Run explicitly (skipped in normal CI):
 //!   cargo test -p spacetimedb-testing --test circles_batching_bench -- --ignored --nocapture
 //!
-//! Set STDB_REDUCER_POOL_CAP externally before running to label the output;
+//! Set STDB_REDUCER_BATCHING externally before running to label the output;
 //! default label is "1". This test never sets that variable itself.
 //!
 //! PURPOSE (kill-criterion stage 2): show whether width≥2 batches with members
@@ -48,7 +48,7 @@ lazy_static! {
 async fn bench_circles() {
     // Read the cap label before touching the module so we reflect the caller's
     // environment, not anything we injected.
-    let cap_label = std::env::var("STDB_REDUCER_POOL_CAP").unwrap_or_else(|_| "1".to_string());
+    let cap_label = std::env::var("STDB_REDUCER_BATCHING").unwrap_or_else(|_| "1".to_string());
 
     let module = MODULE.load_module(DEFAULT_CONFIG, None).await;
 
@@ -279,7 +279,7 @@ const LEARNED_ROUNDS: usize = 20;
 #[tokio::test]
 #[ignore]
 async fn bench_circles_learned() {
-    let cap_label = std::env::var("STDB_REDUCER_POOL_CAP").unwrap_or_else(|_| "1".to_string());
+    let cap_label = std::env::var("STDB_REDUCER_BATCHING").unwrap_or_else(|_| "1".to_string());
 
     // Fresh module instance so learning-phase stats start at zero.
     let module = MODULE.load_module(DEFAULT_CONFIG, None).await;
@@ -476,12 +476,12 @@ async fn bench_circles_learned() {
 /// Emits `THREEWAY …` rows for two workloads (static pair, lost pair) across three
 /// scheduler configurations: base (cap=0, inline), v1/phase-1-5 (cap=1, wildcard
 /// excluded), and v2/phase-6 (cap=1, wildcard promoted to Learned).  The operator
-/// runs this test twice — once with `STDB_REDUCER_POOL_CAP=0` and once with `=1` —
+/// runs this test twice — once with `STDB_REDUCER_BATCHING=0` and once with `=1` —
 /// and assembles the 3-column table from the printed rows.
 #[tokio::test]
 #[ignore]
 async fn bench_three_way() {
-    let cap_label = std::env::var("STDB_REDUCER_POOL_CAP").unwrap_or_else(|_| "1".to_string());
+    let cap_label = std::env::var("STDB_REDUCER_BATCHING").unwrap_or_else(|_| "1".to_string());
 
     // ═══════════════════════════════════════════════════════════════════════════
     // WORKLOAD STATIC — run_game_circles ‖ update_position_with_velocity

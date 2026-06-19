@@ -1,7 +1,7 @@
 #![allow(clippy::disallowed_macros)]
 //! Integration test for the pool-off (kill-switch) path.
 //!
-//! Sets `STDB_REDUCER_POOL_CAP=0` BEFORE any module load so the scheduler is
+//! Sets `STDB_REDUCER_BATCHING=0` BEFORE any module load so the scheduler is
 //! constructed with `PoolState::Off`. Verifies that no forks ever occur and
 //! that all reducers still commit correctly.
 //!
@@ -17,7 +17,7 @@ const N: u64 = 5_000;
 // Set the env var at static-init time — this runs before any module is loaded.
 fn ensure_pool_off() {
     // Safety: this is the only thread alive at test startup in an isolated process.
-    unsafe { std::env::set_var("STDB_REDUCER_POOL_CAP", "0") };
+    unsafe { std::env::set_var("STDB_REDUCER_BATCHING", "0") };
 }
 
 lazy_static! {
@@ -89,7 +89,7 @@ async fn pool_off_no_spawn_no_forks_all_commit() {
     assert_eq!(
         snap.pool_state,
         spacetimedb::host::PoolStateTag::Off,
-        "pool should remain Off with STDB_REDUCER_POOL_CAP=0"
+        "pool should remain Off with STDB_REDUCER_BATCHING=0"
     );
     assert_eq!(snap.forks, 0, "no forks should occur with pool Off");
     assert!(
